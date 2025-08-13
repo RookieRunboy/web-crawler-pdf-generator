@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import { Globe, History, Settings, Home } from 'lucide-react';
+import { Globe, History, Settings, Home, FileStack } from 'lucide-react';
 
 const Navigation: React.FC = () => {
   const location = useLocation();
@@ -10,6 +10,11 @@ const Navigation: React.FC = () => {
       path: '/',
       label: '首页',
       icon: Home
+    },
+    {
+      path: '/batch',
+      label: '批量爬取',
+      icon: FileStack
     },
     {
       path: '/results',
@@ -24,6 +29,9 @@ const Navigation: React.FC = () => {
   ];
   
   const isActive = (path: string) => {
+    if (path === '/batch') {
+      return location.pathname === '/batch' || location.pathname.startsWith('/batch/');
+    }
     return location.pathname === path;
   };
   

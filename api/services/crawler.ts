@@ -90,8 +90,8 @@ class CrawlerService {
 
       // 导航到页面
       const response = await page.goto(url, {
-        waitUntil: 'networkidle2',
-        timeout
+        waitUntil: 'domcontentloaded', // 改为更快的等待条件
+        timeout: Math.max(timeout, 15000) // 确保至少15秒超时
       });
 
       if (!response || !response.ok()) {

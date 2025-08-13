@@ -201,20 +201,28 @@ router.get('/download/:taskId', async (req: Request, res: Response) => {
     }
 
     const filePath = pdfService.getFilePath(task.pdf_filename);
-    const rawFileName = `${task.title || 'webpage'}_${taskId.substring(0, 8)}.pdf`;
+    const rawTitle = (task.title || 'webpage').toString();
+    const rawFileName = `${rawTitle}_${taskId.substring(0, 8)}.pdf`;
     
-    // 清理文件名，移除或替换无效字符
+    // 更严格地清理文件名，确保HTTP头部安全
     const cleanFileName = rawFileName
-      .replace(/["\\/:*?<>|]/g, '_') // 替换无效字符为下划线
-      .replace(/[\x00-\x1f\x7f-\x9f]/g, '') // 移除控制字符
+      .replace(/[\x00-\x1f\x7f-\xff]/g, '') // 移除所有控制字符和扩展ASCII字符
+      .replace(/["\\/:*?<>|\r\n\t\v\f]/g, '_') // 替换文件系统和HTTP不安全字符
+      .replace(/[^\w\u4e00-\u9fff._-]/g, '_') // 只保留字母数字、中文、点、下划线、连字符
+      .replace(/_{2,}/g, '_') // 合并多个连续下划线
+      .replace(/^_+|_+$/g, '') // 移除开头和结尾的下划线
       .trim();
     
-    // 对文件名进行URL编码以确保HTTP头部安全
-    const encodedFileName = encodeURIComponent(cleanFileName);
+    // 确保文件名不为空且长度合理
+    const safeFileName = (cleanFileName && cleanFileName.length > 0) ? 
+      cleanFileName.substring(0, 100) : 'download.pdf';
+    
+    // 对文件名进行URL编码
+    const encodedFileName = encodeURIComponent(safeFileName);
 
-    // 设置响应头
+    // 设置响应头，使用更安全的格式
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${cleanFileName}"; filename*=UTF-8''${encodedFileName}`);
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodedFileName}`);
     
     // 发送文件
     const fileStream = fs.createReadStream(filePath);

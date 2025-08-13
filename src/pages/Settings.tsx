@@ -153,7 +153,7 @@ const Settings: React.FC = () => {
                   type="number"
                   value={localSettings.crawl.timeout / 1000}
                   onChange={(e) => handleSettingChange('crawl', 'timeout', parseInt(e.target.value) * 1000)}
-                  min="10"
+                  min="5"
                   max="300"
                   className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                 />

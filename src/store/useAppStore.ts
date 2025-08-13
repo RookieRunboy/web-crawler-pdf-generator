@@ -12,6 +12,28 @@ export interface Task {
   pdfAvailable?: boolean;
   pdfFilename?: string;
   contentPreview?: string;
+  batchId?: string;
+}
+
+export interface BatchTask {
+  id: string;
+  name: string;
+  status: 'pending' | 'processing' | 'completed' | 'failed';
+  progress: number;
+  totalTasks: number;
+  completedTasks: number;
+  failedTasks: number;
+  zipFilename?: string;
+  zipPath?: string;
+  createdAt: string;
+  completedAt?: string;
+  tasks?: Task[];
+}
+
+export interface BatchOptions {
+  includeImages: boolean;
+  timeout: number;
+  concurrency: number;
 }
 
 export interface AppSettings {
@@ -40,6 +62,17 @@ interface AppState {
     totalPages: number;
   };
   
+  // 批量任务状态
+  currentBatch: BatchTask | null;
+  batchHistory: BatchTask[];
+  batchLoading: boolean;
+  batchPagination: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages: number;
+  };
+  
   // 应用设置
   settings: AppSettings;
   settingsLoading: boolean;
@@ -50,11 +83,20 @@ interface AppState {
   downloadPDF: (taskId: string, filename?: string) => Promise<void>;
   loadTaskHistory: (page?: number, status?: string) => Promise<void>;
   deleteTask: (taskId: string) => Promise<void>;
+  
+  // Batch Actions
+  createBatchTask: (batchData: string, options: BatchOptions) => Promise<{ batchId: string } | null>;
+  loadBatchStatus: (batchId: string) => Promise<BatchTask | null>;
+  loadBatchHistory: (page?: number, status?: string) => Promise<void>;
+  deleteBatchTask: (batchId: string) => Promise<void>;
+  downloadBatchZip: (batchId: string) => Promise<void>;
+  
   loadSettings: () => Promise<void>;
   updateSettings: (newSettings: Partial<AppSettings>) => Promise<void>;
   resetSettings: () => Promise<void>;
   clearError: () => void;
   clearCurrentTask: () => void;
+  clearCurrentBatch: () => void;
 }
 
 const defaultSettings: AppSettings = {
@@ -96,6 +138,18 @@ export const useAppStore = create<AppState>((set, get) => ({
     total: 0,
     totalPages: 0
   },
+  
+  // 批量任务初始状态
+  currentBatch: null,
+  batchHistory: [],
+  batchLoading: false,
+  batchPagination: {
+    page: 1,
+    limit: 20,
+    total: 0,
+    totalPages: 0
+  },
+  
   settings: defaultSettings,
   settingsLoading: false,
 
@@ -338,9 +392,201 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
+  // 创建批量任务
+  createBatchTask: async (batchData: string, options: BatchOptions) => {
+    set({ isLoading: true, error: null, currentBatch: null });
+    
+    try {
+      const response = await fetch('/api/batch/create', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          batchData,
+          options
+        })
+      });
+      
+      if (!response.ok) {
+        throw new Error('创建批量任务失败');
+      }
+      
+      const result = await response.json();
+      
+      if (result.success) {
+        set({ isLoading: false });
+        return { batchId: result.batchId };
+      } else {
+        throw new Error(result.error || '创建批量任务失败');
+      }
+    } catch (error) {
+      set({ 
+        error: error instanceof Error ? error.message : '创建批量任务失败',
+        isLoading: false 
+      });
+      return null;
+    }
+  },
+
+  // 加载批量任务状态
+  loadBatchStatus: async (batchId: string) => {
+    try {
+      const response = await fetch(`/api/batch/status/${batchId}`);
+      
+      if (!response.ok) {
+        throw new Error('获取批量任务状态失败');
+      }
+      
+      const data = await response.json();
+      
+      const batchTask: BatchTask = {
+        id: data.id,
+        name: data.name,
+        status: data.status,
+        progress: data.progress,
+        totalTasks: data.total_tasks,
+        completedTasks: data.completed_tasks,
+        failedTasks: data.failed_tasks,
+        zipFilename: data.zip_filename,
+        zipPath: data.zip_path,
+        createdAt: data.created_at,
+        completedAt: data.completed_at,
+        tasks: data.tasks?.map((task: any) => ({
+          id: task.id,
+          url: task.url,
+          title: task.title,
+          status: task.status,
+          createdAt: task.created_at,
+          updatedAt: task.updated_at,
+          errorMessage: task.error_message,
+          pdfAvailable: !!task.pdf_filename,
+          pdfFilename: task.pdf_filename,
+          batchId: data.id
+        }))
+      };
+      
+      set({ currentBatch: batchTask });
+      return batchTask;
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : '获取批量任务状态失败' });
+      return null;
+    }
+  },
+
+  // 加载批量任务历史
+  loadBatchHistory: async (page = 1, status?: string) => {
+    set({ batchLoading: true });
+    
+    try {
+      const params = new URLSearchParams({
+        page: page.toString(),
+        limit: '20'
+      });
+      
+      if (status) {
+        params.append('status', status);
+      }
+      
+      const response = await fetch(`/api/batch/history?${params}`);
+      
+      if (!response.ok) {
+        throw new Error('获取批量任务历史失败');
+      }
+      
+      const data = await response.json();
+      
+      const batches: BatchTask[] = data.batches.map((batch: any) => ({
+        id: batch.id,
+        name: batch.name,
+        status: batch.status,
+        progress: batch.progress,
+        totalTasks: batch.total_tasks,
+        completedTasks: batch.completed_tasks,
+        failedTasks: batch.failed_tasks,
+        zipFilename: batch.zip_filename,
+        zipPath: batch.zip_path,
+        createdAt: batch.created_at,
+        completedAt: batch.completed_at
+      }));
+      
+      set({ 
+        batchHistory: batches,
+        batchPagination: data.pagination,
+        batchLoading: false 
+      });
+    } catch (error) {
+      set({ 
+        error: error instanceof Error ? error.message : '获取批量任务历史失败',
+        batchLoading: false 
+      });
+    }
+  },
+
+  // 删除批量任务
+  deleteBatchTask: async (batchId: string) => {
+    try {
+      const response = await fetch(`/api/batch/${batchId}`, {
+        method: 'DELETE'
+      });
+      
+      if (!response.ok) {
+        throw new Error('删除批量任务失败');
+      }
+      
+      // 从历史记录中移除
+      const { batchHistory } = get();
+      set({ batchHistory: batchHistory.filter(batch => batch.id !== batchId) });
+      
+      // 如果删除的是当前批量任务，清除当前批量任务
+      const { currentBatch } = get();
+      if (currentBatch?.id === batchId) {
+        set({ currentBatch: null });
+      }
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : '删除批量任务失败' });
+    }
+  },
+
+  // 下载批量ZIP文件
+  downloadBatchZip: async (batchId: string) => {
+    try {
+      const response = await fetch(`/api/batch/download/${batchId}`);
+      
+      if (!response.ok) {
+        throw new Error('下载失败');
+      }
+      
+      const blob = await response.blob();
+      const contentDisposition = response.headers.get('Content-Disposition');
+      let filename = `batch_${batchId}.zip`;
+      
+      if (contentDisposition) {
+        const filenameMatch = contentDisposition.match(/filename="(.+)"/);;
+        if (filenameMatch) {
+          filename = filenameMatch[1];
+        }
+      }
+      
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : '下载失败' });
+    }
+  },
+
   // 清除错误
   clearError: () => set({ error: null }),
   
   // 清除当前任务
-  clearCurrentTask: () => set({ currentTask: null })
+  clearCurrentTask: () => set({ currentTask: null }),
+  
+  // 清除当前批量任务
+  clearCurrentBatch: () => set({ currentBatch: null })
 }));

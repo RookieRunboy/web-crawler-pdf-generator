@@ -8,6 +8,7 @@ import * as fs from 'fs';
 // 导入路由
 import tasksRouter from './routes/tasks.js';
 import settingsRouter from './routes/settings.js';
+import batchRouter from './routes/batch.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -66,6 +67,7 @@ app.get('/api/health', (req, res) => {
 // API路由
 app.use('/api/tasks', tasksRouter);
 app.use('/api/settings', settingsRouter);
+app.use('/api/batch', batchRouter);
 
 // 静态文件服务（用于前端）
 if (process.env.NODE_ENV === 'production') {
