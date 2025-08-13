@@ -62,6 +62,9 @@ class PDFService {
   private generateHTML(title: string, content: string, url: string, settings: PDFSettings): string {
     const { includeImages = true, includeLinks = true } = settings;
     
+    // 检查content是否已经是HTML格式
+    const isHTMLContent = content.includes('<') && content.includes('>');
+    
     return `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -98,7 +101,75 @@ class PDFService {
         .content {
             font-size: 16px;
             line-height: 1.8;
+        }
+        /* 段落样式 */
+        .content p {
+            margin: 0 0 16px 0;
             text-align: justify;
+            text-indent: 2em;
+        }
+        /* 标题样式 */
+        .content h1, .content h2, .content h3, .content h4, .content h5, .content h6 {
+            margin: 24px 0 16px 0;
+            font-weight: bold;
+            line-height: 1.4;
+            page-break-after: avoid;
+        }
+        .content h1 { font-size: 24px; color: #2c3e50; }
+        .content h2 { font-size: 20px; color: #34495e; }
+        .content h3 { font-size: 18px; color: #34495e; }
+        .content h4 { font-size: 16px; color: #34495e; }
+        .content h5 { font-size: 14px; color: #34495e; }
+        .content h6 { font-size: 14px; color: #34495e; }
+        /* 列表样式 */
+        .content ul, .content ol {
+            margin: 16px 0;
+            padding-left: 2em;
+        }
+        .content li {
+            margin: 8px 0;
+            line-height: 1.6;
+        }
+        /* 引用样式 */
+        .content blockquote {
+            margin: 16px 0;
+            padding: 12px 20px;
+            border-left: 4px solid #007bff;
+            background-color: #f8f9fa;
+            font-style: italic;
+        }
+        /* 强调样式 */
+        .content strong, .content b {
+            font-weight: bold;
+        }
+        .content em, .content i {
+            font-style: italic;
+        }
+        /* 图片样式 */
+        .content img {
+            max-width: 100%;
+            height: auto;
+            margin: 16px 0;
+            display: block;
+        }
+        /* 链接样式 */
+        .content a {
+            color: #007bff;
+            text-decoration: underline;
+        }
+        /* 分隔线样式 */
+        .content hr {
+            margin: 24px 0;
+            border: none;
+            border-top: 1px solid #ddd;
+        }
+        /* 代码样式 */
+        .content code {
+            background-color: #f1f3f4;
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
         }
         .footer {
             margin-top: 40px;
@@ -108,11 +179,18 @@ class PDFService {
             color: #999;
             text-align: center;
         }
-        ${!includeImages ? 'img { display: none; }' : ''}
-        ${!includeLinks ? 'a { color: inherit; text-decoration: none; }' : ''}
+        ${!includeImages ? '.content img { display: none; }' : ''}
+        ${!includeLinks ? '.content a { color: inherit; text-decoration: none; }' : ''}
         @media print {
             body { margin: 0; }
             .header { page-break-after: avoid; }
+            .content h1, .content h2, .content h3, .content h4, .content h5, .content h6 {
+                page-break-after: avoid;
+            }
+            .content p {
+                orphans: 3;
+                widows: 3;
+            }
         }
     </style>
 </head>
@@ -122,7 +200,7 @@ class PDFService {
         <div class="url">来源: ${url}</div>
     </div>
     <div class="content">
-        ${content}
+        ${isHTMLContent ? content : `<p>${content.replace(/\n\n/g, '</p><p>').replace(/\n/g, '<br>')}</p>`}
     </div>
     <div class="footer">
         <p>生成时间: ${new Date().toLocaleString('zh-CN')}</p>
@@ -173,9 +251,22 @@ class PDFService {
         `
       };
       
-      // 生成文件名
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const fileName = `${taskId}_${timestamp}.pdf`;
+      // 生成文件名 - 基于任务标题
+      const rawTitle = (title || 'webpage').toString();
+      const rawFileName = `${rawTitle}_${taskId.substring(0, 8)}.pdf`;
+      
+      // 清理文件名，使用与下载时相同的逻辑
+      const cleanFileName = rawFileName
+        .replace(/[\x00-\x1f\x7f-\xff]/g, '') // 移除所有控制字符和扩展ASCII字符
+        .replace(/["\\/:*?<>|\r\n\t\v\f]/g, '_') // 替换文件系统和HTTP不安全字符
+        .replace(/[^\w\u4e00-\u9fff._-]/g, '_') // 只保留字母数字、中文、点、下划线、连字符
+        .replace(/_{2,}/g, '_') // 合并多个连续下划线
+        .replace(/^_+|_+$/g, '') // 移除开头和结尾的下划线
+        .trim();
+      
+      // 确保文件名不为空且长度合理
+      const fileName = (cleanFileName && cleanFileName.length > 0) ? 
+        cleanFileName.substring(0, 100) : `task_${taskId.substring(0, 8)}.pdf`;
       const filePath = path.join(this.outputDir, fileName);
       
       // 生成PDF

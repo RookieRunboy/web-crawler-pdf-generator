@@ -71,6 +71,34 @@ export interface TaskHistoryResponse {
   error?: string;
 }
 
+export interface TaskIdsResponse {
+  success: boolean;
+  data?: {
+    taskIds: string[];
+    total: number;
+  };
+  error?: string;
+}
+
+export interface TaskDetailsResponse {
+  success: boolean;
+  data?: {
+    tasks: Array<{
+      id: string;
+      url: string;
+      title?: string;
+      status: string;
+      createdAt: string;
+      updatedAt: string;
+      errorMessage?: string;
+      pdfAvailable: boolean;
+      pdfFilename?: string;
+    }>;
+    total: number;
+  };
+  error?: string;
+}
+
 export interface SettingsResponse {
   success: boolean;
   data?: {
@@ -152,6 +180,51 @@ class ApiClient {
   async deleteTask(taskId: string): Promise<{ success: boolean; message?: string; error?: string }> {
     return this.request(`/tasks/${taskId}`, {
       method: 'DELETE',
+    });
+  }
+
+  async deleteTasks(taskIds: string[]): Promise<{ success: boolean; message?: string; error?: string; deletedCount?: number }> {
+    return this.request('/tasks/batch', {
+      method: 'DELETE',
+      body: JSON.stringify({ taskIds }),
+    });
+  }
+
+  async downloadMultiplePDFs(taskIds: string[]): Promise<Blob> {
+    const url = `${API_BASE_URL}/tasks/download/batch`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ taskIds }),
+    });
+    
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || 'Batch download failed');
+    }
+    
+    return response.blob();
+  }
+
+  async getAllTaskIds(status?: string): Promise<TaskIdsResponse> {
+    const params = new URLSearchParams();
+    
+    if (status) {
+      params.append('status', status);
+    }
+    
+    const queryString = params.toString();
+    const endpoint = queryString ? `/tasks/all-ids?${queryString}` : '/tasks/all-ids';
+    
+    return this.request<TaskIdsResponse>(endpoint);
+  }
+
+  async getTaskDetails(taskIds: string[]): Promise<TaskDetailsResponse> {
+    return this.request<TaskDetailsResponse>('/tasks/details', {
+      method: 'POST',
+      body: JSON.stringify({ taskIds }),
     });
   }
 

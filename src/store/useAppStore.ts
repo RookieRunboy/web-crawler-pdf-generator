@@ -61,6 +61,12 @@ interface AppState {
     total: number;
     totalPages: number;
   };
+  currentPage: number;
+  statusFilter: string;
+  
+  // 批量操作状态
+  selectedTaskIds: string[];
+  batchOperationLoading: boolean;
   
   // 批量任务状态
   currentBatch: BatchTask | null;
@@ -83,6 +89,14 @@ interface AppState {
   downloadPDF: (taskId: string, filename?: string) => Promise<void>;
   loadTaskHistory: (page?: number, status?: string) => Promise<void>;
   deleteTask: (taskId: string) => Promise<void>;
+  
+  // 批量操作Actions
+  toggleTaskSelection: (taskId: string) => void;
+  selectAllTasks: () => void;
+  selectAllTasksFromAllPages: (status?: string) => Promise<void>;
+  clearTaskSelection: () => void;
+  deleteTasks: (taskIds: string[]) => Promise<void>;
+  downloadMultiplePDFs: (taskIds: string[]) => Promise<{ downloadedCount: number; totalSelected: number }>;
   
   // Batch Actions
   createBatchTask: (batchData: string, options: BatchOptions) => Promise<{ batchId: string } | null>;
@@ -138,6 +152,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     total: 0,
     totalPages: 0
   },
+  currentPage: 1,
+  statusFilter: 'all',
+  
+  // 批量操作初始状态
+  selectedTaskIds: [],
+  batchOperationLoading: false,
   
   // 批量任务初始状态
   currentBatch: null,
@@ -283,6 +303,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         set({ 
           taskHistory: tasks,
           historyPagination: response.data.pagination,
+          currentPage: page,
+          statusFilter: status || 'all',
           historyLoading: false 
         });
       }
@@ -578,6 +600,126 @@ export const useAppStore = create<AppState>((set, get) => ({
       window.URL.revokeObjectURL(url);
     } catch (error) {
       set({ error: error instanceof Error ? error.message : '下载失败' });
+    }
+  },
+
+  // 批量操作方法
+  toggleTaskSelection: (taskId: string) => {
+    const { selectedTaskIds } = get();
+    const isSelected = selectedTaskIds.includes(taskId);
+    
+    if (isSelected) {
+      set({ selectedTaskIds: selectedTaskIds.filter(id => id !== taskId) });
+    } else {
+      set({ selectedTaskIds: [...selectedTaskIds, taskId] });
+    }
+  },
+
+  selectAllTasks: () => {
+    const { taskHistory } = get();
+    set({ selectedTaskIds: taskHistory.map(task => task.id) });
+  },
+
+  selectAllTasksFromAllPages: async (status?: string) => {
+    set({ batchOperationLoading: true });
+    
+    try {
+      const response = await apiClient.getAllTaskIds(status);
+      
+      if (response.success && response.data) {
+        set({ 
+          selectedTaskIds: response.data.taskIds,
+          batchOperationLoading: false 
+        });
+      } else {
+        throw new Error(response.error || 'Failed to get all task IDs');
+      }
+    } catch (error) {
+      set({ 
+        error: error instanceof Error ? error.message : 'Failed to select all tasks',
+        batchOperationLoading: false 
+      });
+    }
+  },
+
+  clearTaskSelection: () => {
+    set({ selectedTaskIds: [] });
+  },
+
+  deleteTasks: async (taskIds: string[]) => {
+    set({ batchOperationLoading: true });
+    
+    try {
+      const response = await apiClient.deleteTasks(taskIds);
+      
+      if (response.success) {
+        // 清除选中的任务
+        set({ selectedTaskIds: [] });
+        
+        // 如果删除的任务中包含当前任务，清除当前任务
+        const { currentTask } = get();
+        if (currentTask && taskIds.includes(currentTask.id)) {
+          set({ currentTask: null });
+        }
+        
+        // 重新加载当前页的任务历史以确保数据同步
+        const { currentPage, statusFilter } = get();
+        await get().loadTaskHistory(currentPage, statusFilter);
+        
+        set({ batchOperationLoading: false });
+      } else {
+        throw new Error(response.error || 'Failed to delete tasks');
+      }
+    } catch (error) {
+      set({ 
+        error: error instanceof Error ? error.message : 'Batch delete failed',
+        batchOperationLoading: false 
+      });
+    }
+  },
+
+  downloadMultiplePDFs: async (taskIds: string[]) => {
+    set({ batchOperationLoading: true });
+    
+    try {
+      // 首先获取任务详细信息，筛选出可下载的任务
+      const taskDetailsResponse = await apiClient.getTaskDetails(taskIds);
+      
+      if (!taskDetailsResponse.success || !taskDetailsResponse.data) {
+        throw new Error(taskDetailsResponse.error || 'Failed to get task details');
+      }
+      
+      // 筛选出已完成且有PDF的任务
+      const downloadableTaskIds = taskDetailsResponse.data.tasks
+        .filter(task => task.status === 'completed' && task.pdfAvailable)
+        .map(task => task.id);
+      
+      if (downloadableTaskIds.length === 0) {
+        throw new Error('没有可下载的PDF文件');
+      }
+      
+      const blob = await apiClient.downloadMultiplePDFs(downloadableTaskIds);
+      
+      // 创建下载链接
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `batch_pdfs_${new Date().getTime()}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+      
+      set({ batchOperationLoading: false });
+      
+      // 返回实际下载的任务数量
+      return { downloadedCount: downloadableTaskIds.length, totalSelected: taskIds.length };
+    } catch (error) {
+      set({ 
+        error: error instanceof Error ? error.message : 'Batch download failed',
+        batchOperationLoading: false 
+      });
+      throw error;
     }
   },
 

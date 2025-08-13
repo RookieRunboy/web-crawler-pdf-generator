@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Download, Clock, CheckCircle, AlertCircle, Trash2, Eye, ArrowLeft, Filter } from 'lucide-react';
+import { Download, Clock, CheckCircle, AlertCircle, Trash2, Eye, ArrowLeft, Filter, Square, CheckSquare, Loader2, ChevronDown } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
 import { toast } from 'sonner';
 import { Link } from 'react-router-dom';
@@ -7,16 +7,25 @@ import { Link } from 'react-router-dom';
 const Results: React.FC = () => {
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [currentPage, setCurrentPage] = useState(1);
+  const [showSelectOptions, setShowSelectOptions] = useState(false);
   
   const {
     taskHistory,
     historyLoading,
     historyPagination,
     error,
+    selectedTaskIds,
+    batchOperationLoading,
     loadTaskHistory,
     deleteTask,
     downloadPDF,
-    clearError
+    clearError,
+    toggleTaskSelection,
+    selectAllTasks,
+    selectAllTasksFromAllPages,
+    clearTaskSelection,
+    deleteTasks,
+    downloadMultiplePDFs
   } = useAppStore();
 
   useEffect(() => {
@@ -29,6 +38,23 @@ const Results: React.FC = () => {
       clearError();
     }
   }, [error, clearError]);
+
+  // 点击外部关闭下拉菜单
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (showSelectOptions) {
+        const target = event.target as Element;
+        if (!target.closest('.select-dropdown')) {
+          setShowSelectOptions(false);
+        }
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [showSelectOptions]);
 
   const handlePageChange = (page: number) => {
     setCurrentPage(page);
@@ -53,6 +79,67 @@ const Results: React.FC = () => {
       toast.success('PDF下载成功');
     } catch (error) {
       toast.error('下载失败');
+    }
+  };
+
+  const handleSelectAll = () => {
+    if (selectedTaskIds.length === taskHistory.length) {
+      clearTaskSelection();
+    } else {
+      selectAllTasks();
+    }
+  };
+
+  const handleSelectAllPages = async () => {
+    try {
+      await selectAllTasksFromAllPages(statusFilter === 'all' ? undefined : statusFilter);
+      setShowSelectOptions(false);
+      toast.success('已选择所有页的任务');
+    } catch (error) {
+      toast.error('全选所有页失败');
+    }
+  };
+
+  const handleSelectCurrentPage = () => {
+    selectAllTasks();
+    setShowSelectOptions(false);
+  };
+
+  const handleBatchDelete = async () => {
+    if (selectedTaskIds.length === 0) {
+      toast.error('请先选择要删除的任务');
+      return;
+    }
+
+    if (window.confirm(`确定要删除选中的 ${selectedTaskIds.length} 个任务吗？`)) {
+      try {
+        await deleteTasks(selectedTaskIds);
+        toast.success(`成功删除 ${selectedTaskIds.length} 个任务`);
+      } catch (error) {
+        toast.error('批量删除失败');
+      }
+    }
+  };
+
+  const handleBatchDownload = async () => {
+    if (selectedTaskIds.length === 0) {
+      toast.error('请先选择要下载的任务');
+      return;
+    }
+
+    try {
+      const result = await downloadMultiplePDFs(selectedTaskIds);
+      
+      if (result.downloadedCount === 0) {
+        toast.error('所选任务中没有可下载的PDF文件');
+      } else if (result.downloadedCount === result.totalSelected) {
+        toast.success(`成功下载 ${result.downloadedCount} 个PDF文件`);
+      } else {
+        toast.success(`成功下载 ${result.downloadedCount} 个PDF文件（共选择 ${result.totalSelected} 个任务）`);
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : '批量下载失败';
+      toast.error(errorMessage);
     }
   };
 
@@ -197,6 +284,98 @@ const Results: React.FC = () => {
           </div>
         </div>
 
+        {/* Batch Operations Toolbar */}
+        {taskHistory.length > 0 && (
+          <div className="bg-white rounded-lg shadow-md p-4 mb-6">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-4">
+                <div className="relative select-dropdown">
+                  <button
+                    onClick={() => setShowSelectOptions(!showSelectOptions)}
+                    className="flex items-center space-x-2 px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 rounded-lg transition-colors border border-gray-300"
+                  >
+                    {selectedTaskIds.length > 0 ? (
+                      <CheckSquare className="w-4 h-4 text-blue-600" />
+                    ) : (
+                      <Square className="w-4 h-4" />
+                    )}
+                    <span>选择任务</span>
+                    <ChevronDown className="w-4 h-4" />
+                  </button>
+                  
+                  {showSelectOptions && (
+                    <div className="absolute top-full left-0 mt-1 bg-white border border-gray-300 rounded-lg shadow-lg z-10 min-w-[160px]">
+                      <button
+                        onClick={handleSelectCurrentPage}
+                        className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 first:rounded-t-lg"
+                      >
+                        全选当前页
+                      </button>
+                      <button
+                        onClick={handleSelectAllPages}
+                        disabled={batchOperationLoading}
+                        className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 last:rounded-b-lg disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {batchOperationLoading ? '加载中...' : '全选所有页'}
+                      </button>
+                      {selectedTaskIds.length > 0 && (
+                        <button
+                          onClick={() => {
+                            clearTaskSelection();
+                            setShowSelectOptions(false);
+                          }}
+                          className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 last:rounded-b-lg border-t border-gray-200"
+                        >
+                          清除选择
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+                
+                {selectedTaskIds.length > 0 && (
+                  <span className="text-sm text-gray-600">
+                    已选择 {selectedTaskIds.length} 个任务
+                    {historyPagination.total > 0 && (
+                      <span className="text-gray-400"> / 共 {historyPagination.total} 个</span>
+                    )}
+                  </span>
+                )}
+              </div>
+              
+              {selectedTaskIds.length > 0 && (
+                <div className="flex items-center space-x-2">
+                  <button
+                    onClick={handleBatchDownload}
+                    disabled={batchOperationLoading}
+                    className="flex items-center px-3 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {batchOperationLoading ? (
+                      <Loader2 className="w-4 h-4 mr-1 animate-spin" />
+                    ) : (
+                      <Download className="w-4 h-4 mr-1" />
+                    )}
+                    {batchOperationLoading ? '正在下载...' : '批量下载'}
+                  </button>
+                  
+                  <button
+                    onClick={handleBatchDelete}
+                    disabled={batchOperationLoading}
+                    className="flex items-center px-3 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {batchOperationLoading ? (
+                      <Loader2 className="w-4 h-4 mr-1 animate-spin" />
+                    ) : (
+                      <Trash2 className="w-4 h-4 mr-1" />
+                    )}
+                    {batchOperationLoading ? '正在删除...' : '批量删除'}
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Task List */}
         <div className="bg-white rounded-lg shadow-md">
           {historyLoading ? (
@@ -220,7 +399,19 @@ const Results: React.FC = () => {
             <div className="divide-y divide-gray-200">
               {taskHistory.map((task) => (
                 <div key={task.id} className="p-6 hover:bg-gray-50 transition-colors">
-                  <div className="flex items-start justify-between">
+                  <div className="flex items-start space-x-4">
+                    {/* Checkbox */}
+                    <div className="flex-shrink-0 pt-1">
+                      <button
+                        onClick={() => toggleTaskSelection(task.id)}
+                        className="flex items-center justify-center w-5 h-5 border-2 border-gray-300 rounded hover:border-blue-500 transition-colors"
+                      >
+                        {selectedTaskIds.includes(task.id) && (
+                          <CheckSquare className="w-4 h-4 text-blue-600" />
+                        )}
+                      </button>
+                    </div>
+                    
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center space-x-3 mb-2">
                         {getStatusIcon(task.status)}
@@ -257,7 +448,7 @@ const Results: React.FC = () => {
                       )}
                     </div>
                     
-                    <div className="flex items-center space-x-2 ml-4">
+                    <div className="flex items-center space-x-2">
                       {task.status === 'completed' && task.pdfAvailable && (
                         <button
                           onClick={() => handleDownload(task.id, task.pdfFilename)}
