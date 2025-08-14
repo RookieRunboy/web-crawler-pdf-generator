@@ -4,6 +4,10 @@ import { Browser, Page } from 'puppeteer';
 import * as cheerio from 'cheerio';
 import fs from 'fs';
 import path from 'path';
+import axios from 'axios';
+import * as zlib from 'zlib';
+import { URL } from 'url';
+import { robotsService } from './robotsService';
 
 // 使用stealth插件
 puppeteer.use(StealthPlugin());
@@ -15,6 +19,7 @@ export interface CrawlSettings {
   timeout?: number;
   waitForSelector?: string;
   userAgent?: string;
+  useHttpCrawler?: boolean; // 新增：是否使用HTTP爬虫替代Puppeteer
 }
 
 export interface CrawlResult {
@@ -26,14 +31,65 @@ export interface CrawlResult {
   error?: string;
 }
 
-class CrawlerService {
+export class CrawlerService {
   private browser: Browser | null = null;
   private pagePool: Page[] = [];
-  private maxPoolSize: number = 20; // 增加页面池大小
+  private maxPoolSize = parseInt(process.env.CRAWLER_MAX_PAGES || '20'); // 可配置的页面池大小，默认20个
   private currentPoolSize: number = 0;
   private browserHealthy: boolean = true;
+  private dynamicMaxPoolSize: number = this.maxPoolSize; // 动态调整的页面池大小
+  private consecutiveHighMemoryCount: number = 0; // 连续高内存使用次数
   private lastHealthCheck: number = 0;
   private healthCheckInterval: number = 30000; // 30秒
+  
+  // HTTP爬虫相关属性
+  private lastRequestTime: number = 0;
+  private requestCount: number = 0;
+  private sessionStartTime: number = Date.now();
+  private userAgents = [
+    // Chrome on macOS
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    // Chrome on Windows
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    // Safari on macOS
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+    // Firefox on Windows
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+    // Firefox on macOS
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0',
+    // Edge on Windows
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0',
+    // Chrome on Linux
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+  ];
+  private currentUserAgentIndex: number = 0;
+
+  constructor() {
+    // 每小时重启浏览器以提高稳定性
+    setInterval(async () => {
+      try {
+        await this.restartBrowser();
+      } catch (error) {
+        console.error('Failed to restart browser:', error);
+      }
+    }, 60 * 60 * 1000); // 1小时
+
+    // 更频繁的健康检查，每30秒检查一次
+    setInterval(async () => {
+      await this.checkBrowserHealth();
+    }, 30 * 1000); // 30秒
+  }
   private browserStartTime: number = 0;
   private browserRestartInterval: number = 3600000; // 1小时重启一次
   private memoryUsage: { rss: number; heapUsed: number; heapTotal: number } = { rss: 0, heapUsed: 0, heapTotal: 0 };
@@ -148,7 +204,7 @@ class CrawlerService {
     await this.configurePageForPerformance(page);
     
     this.currentPoolSize++;
-    console.log(`Created new page, pool size: ${this.currentPoolSize}`);
+    console.log(`Created new page, current pool size: ${this.currentPoolSize}/${this.dynamicMaxPoolSize}`);
     return page;
   }
 
@@ -295,6 +351,20 @@ class CrawlerService {
       // 简单的健康检查：获取浏览器版本
       await this.browser.version();
       this.browserHealthy = true;
+      
+      // 检查页面池健康状态，使用动态页面池大小
+      if (this.pagePool.length > this.dynamicMaxPoolSize) {
+        console.log(`Page pool overflow detected (${this.pagePool.length} > ${this.dynamicMaxPoolSize}), cleaning up excess pages...`);
+        const excessPages = this.pagePool.splice(this.dynamicMaxPoolSize);
+        for (const page of excessPages) {
+          try {
+            await page.close();
+          } catch (error) {
+            console.error('Error closing excess page:', error);
+          }
+        }
+        this.currentPoolSize = this.pagePool.length;
+      }
     } catch (error) {
       console.warn('Browser health check failed:', error);
       this.browserHealthy = false;
@@ -333,10 +403,28 @@ class CrawlerService {
       
       console.log(`Memory usage - RSS: ${rssInMB}MB, Heap Used: ${heapUsedInMB}MB, Heap Total: ${heapTotalInMB}MB, Pool Size: ${this.pagePool.length}`);
       
-      // 如果内存使用过高，触发清理
-      if (rssInMB > 2048 || heapUsedInMB > 1536) { // RSS > 2GB 或 Heap > 1.5GB
-        console.warn('High memory usage detected, triggering cleanup...');
+      // 降低内存清理阈值，根据配置的页面池大小动态调整
+      const memoryThreshold = this.maxPoolSize <= 8 ? 1024 : 1536; // 低并发时1GB，否则1.5GB
+      
+      if (rssInMB > memoryThreshold) {
+        console.log(`High memory usage detected (${rssInMB.toFixed(2)}MB > ${memoryThreshold}MB), performing cleanup...`);
         await this.performMemoryCleanup();
+        
+        // 动态调整：连续高内存使用时降低页面池大小
+        this.consecutiveHighMemoryCount++;
+        if (this.consecutiveHighMemoryCount >= 3 && this.dynamicMaxPoolSize > 2) {
+          this.dynamicMaxPoolSize = Math.max(2, this.dynamicMaxPoolSize - 1);
+          console.log(`Reducing dynamic pool size to ${this.dynamicMaxPoolSize} due to high memory pressure`);
+        }
+      } else {
+        // 内存正常时重置计数器，并考虑恢复页面池大小
+        if (this.consecutiveHighMemoryCount > 0) {
+          this.consecutiveHighMemoryCount = 0;
+          if (this.dynamicMaxPoolSize < this.maxPoolSize && rssInMB < memoryThreshold * 0.7) {
+            this.dynamicMaxPoolSize = Math.min(this.maxPoolSize, this.dynamicMaxPoolSize + 1);
+            console.log(`Increasing dynamic pool size to ${this.dynamicMaxPoolSize} due to low memory usage`);
+          }
+        }
       }
     } catch (error) {
       console.error('Error checking memory usage:', error);
@@ -626,8 +714,14 @@ class CrawlerService {
       includeImages = true,
       timeout = 30000,
       waitForSelector,
-      userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      useHttpCrawler = true // 默认使用HTTP爬虫
     } = settings;
+
+    // 如果使用HTTP爬虫，调用HTTP爬虫方法
+    if (useHttpCrawler) {
+      return await this.crawlPageWithHttp(url, settings);
+    }
 
     // 重试配置
     const maxRetries = 3;
@@ -959,13 +1053,410 @@ class CrawlerService {
     }
   }
 
+  /**
+   * 使用HTTP爬虫模式爬取页面
+   */
+  private async crawlPageWithHttp(url: string, settings: CrawlSettings = {}): Promise<CrawlResult> {
+    const { timeout = 30000, includeImages = true } = settings;
+    const maxRetries = 3;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        console.log(`HTTP crawling attempt ${attempt}/${maxRetries} for URL: ${url}`);
+        
+        // 检查robots.txt权限
+        const robotsAllowed = await robotsService.isAllowed(url, this.getNextUserAgent());
+        if (!robotsAllowed) {
+          return {
+            success: false,
+            error: 'Blocked by robots.txt'
+          };
+        }
+        
+        // 遵守crawl-delay
+        const crawlDelay = await robotsService.getCrawlDelay(url, this.getNextUserAgent());
+        if (crawlDelay > 0) {
+          const timeSinceLastRequest = Date.now() - this.lastRequestTime;
+          const delayNeeded = (crawlDelay * 1000) - timeSinceLastRequest;
+          if (delayNeeded > 0) {
+            console.log(`Respecting crawl-delay: waiting ${delayNeeded}ms`);
+            await new Promise(resolve => setTimeout(resolve, delayNeeded));
+          }
+        }
+        
+        // 智能延迟（2-8秒随机）
+        const smartDelay = Math.floor(Math.random() * 6000) + 2000;
+        await new Promise(resolve => setTimeout(resolve, smartDelay));
+        
+        // 生成请求头
+        const headers = this.generateRealisticHeaders(url);
+        
+        // 发送HTTP请求
+        const response = await axios.get(url, {
+          headers,
+          timeout,
+          maxRedirects: 5,
+          validateStatus: (status) => status < 400,
+          decompress: true,
+          responseType: 'text'
+        });
+        
+        this.lastRequestTime = Date.now();
+        
+        // 解析HTML
+        const $ = cheerio.load(response.data);
+        
+        // 提取标题
+        const title = $('title').text().trim() || $('h1').first().text().trim() || 'No title found';
+        
+        // 提取正文内容
+        const content = this.extractMainContent($, url);
+        
+        if (!content || content.trim().length < 100) {
+          throw new Error('Insufficient content extracted');
+        }
+        
+        // 提取图片
+        const images: string[] = [];
+        if (includeImages) {
+          $('img[src]').each((_, element) => {
+            const src = $(element).attr('src');
+            if (src) {
+              try {
+                const absoluteUrl = new URL(src, url).href;
+                images.push(absoluteUrl);
+              } catch (e) {
+                // 忽略无效URL
+              }
+            }
+          });
+        }
+        
+        // 提取链接
+        const links: string[] = [];
+        $('a[href]').each((_, element) => {
+          const href = $(element).attr('href');
+          if (href && href.startsWith('http')) {
+            links.push(href);
+          }
+        });
+        
+        console.log(`HTTP crawling successful for ${url}, content length: ${content.length}`);
+        
+        return {
+          success: true,
+          content,
+          title,
+          images: images.slice(0, 50),
+          links: links.slice(0, 100)
+        };
+        
+      } catch (error) {
+        console.error(`HTTP crawl error on attempt ${attempt}:`, error);
+        
+        if (attempt === maxRetries) {
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : 'HTTP crawling failed'
+          };
+        }
+        
+        // 重试延迟
+        const retryDelay = Math.floor(Math.random() * 3000) + 2000;
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+      }
+    }
+    
+    return {
+      success: false,
+      error: 'All HTTP crawling attempts failed'
+    };
+  }
+
+  /**
+   * 获取下一个User-Agent
+   */
+  private getNextUserAgent(): string {
+    const userAgent = this.userAgents[this.currentUserAgentIndex];
+    this.currentUserAgentIndex = (this.currentUserAgentIndex + 1) % this.userAgents.length;
+    return userAgent;
+  }
+
+  /**
+   * 生成真实的请求头
+   */
+  private generateRealisticHeaders(url: string): Record<string, string> {
+    const userAgent = this.getNextUserAgent();
+    const parsedUrl = new URL(url);
+    
+    const isChrome = userAgent.includes('Chrome') && !userAgent.includes('Edg');
+    const isFirefox = userAgent.includes('Firefox');
+    const isSafari = userAgent.includes('Safari') && !userAgent.includes('Chrome');
+    const isEdge = userAgent.includes('Edg');
+    const isMac = userAgent.includes('Macintosh');
+    const isWindows = userAgent.includes('Windows');
+    const isLinux = userAgent.includes('Linux');
+    
+    // 基础请求头
+    const headers: Record<string, string> = {
+      'User-Agent': userAgent,
+      'Accept-Language': this.getRandomAcceptLanguage(),
+      'Accept-Encoding': 'gzip, deflate, br',
+      'DNT': Math.random() > 0.5 ? '1' : '0',
+      'Connection': 'keep-alive',
+      'Upgrade-Insecure-Requests': '1',
+      'Cache-Control': this.getRandomCacheControl(),
+      'Referer': `${parsedUrl.protocol}//${parsedUrl.host}/`,
+      'Host': parsedUrl.host
+    };
+
+    // 根据浏览器类型设置Accept头
+    if (isChrome || isEdge) {
+      headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7';
+    } else if (isFirefox) {
+      headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8';
+    } else if (isSafari) {
+      headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8';
+    }
+
+    // Sec-Fetch 头（Chrome和Edge）
+    if (isChrome || isEdge) {
+      headers['Sec-Fetch-Dest'] = 'document';
+      headers['Sec-Fetch-Mode'] = 'navigate';
+      headers['Sec-Fetch-Site'] = Math.random() > 0.7 ? 'same-origin' : 'none';
+      headers['Sec-Fetch-User'] = '?1';
+      
+      // Client Hints
+      const chromeVersion = this.extractChromeVersion(userAgent);
+      headers['sec-ch-ua'] = `"Not_A Brand";v="8", "Chromium";v="${chromeVersion}", "${isEdge ? 'Microsoft Edge' : 'Google Chrome'}";v="${chromeVersion}"`;
+      headers['sec-ch-ua-mobile'] = '?0';
+      
+      if (isMac) {
+        headers['sec-ch-ua-platform'] = '"macOS"';
+      } else if (isWindows) {
+        headers['sec-ch-ua-platform'] = '"Windows"';
+      } else if (isLinux) {
+        headers['sec-ch-ua-platform'] = '"Linux"';
+      }
+    }
+
+    // 随机添加一些可选头
+    if (Math.random() > 0.3) {
+      headers['Pragma'] = 'no-cache';
+    }
+    
+    if (Math.random() > 0.5) {
+      headers['Sec-GPC'] = '1';
+    }
+
+    return headers;
+  }
+
+  private getRandomAcceptLanguage(): string {
+    const languages = [
+      'zh-CN,zh;q=0.9,en;q=0.8',
+      'zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7',
+      'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+      'zh-CN,zh-TW;q=0.9,zh;q=0.8,en;q=0.7',
+      'zh-CN,en;q=0.9,zh;q=0.8'
+    ];
+    return languages[Math.floor(Math.random() * languages.length)];
+  }
+
+  private getRandomCacheControl(): string {
+    const controls = [
+      'max-age=0',
+      'no-cache',
+      'max-age=0, no-cache',
+      'no-cache, no-store, must-revalidate'
+    ];
+    return controls[Math.floor(Math.random() * controls.length)];
+  }
+
+  private extractChromeVersion(userAgent: string): string {
+    const match = userAgent.match(/Chrome\/(\d+)/);
+    return match ? match[1] : '120';
+  }
+
+  private async applyIntelligentDelay(): Promise<void> {
+    const now = Date.now();
+    const timeSinceLastRequest = now - this.lastRequestTime;
+    
+    // 基础延迟：200-800ms
+    let baseDelay = Math.random() * 600 + 200;
+    
+    // 根据请求频率调整延迟
+    const sessionDuration = now - this.sessionStartTime;
+    const requestsPerMinute = (this.requestCount / sessionDuration) * 60000;
+    
+    if (requestsPerMinute > 30) {
+      // 高频请求，增加延迟
+      baseDelay *= 2;
+    } else if (requestsPerMinute > 20) {
+      baseDelay *= 1.5;
+    }
+    
+    // 如果上次请求时间太近，额外延迟
+    if (timeSinceLastRequest < 1000) {
+      baseDelay += Math.random() * 1000 + 500;
+    }
+    
+    // 随机化延迟模式
+    if (Math.random() > 0.8) {
+      // 20%概率模拟用户停顿思考
+      baseDelay += Math.random() * 2000 + 1000;
+    }
+    
+    // 限制最大延迟
+    baseDelay = Math.min(baseDelay, 5000);
+    
+    if (baseDelay > 0) {
+      await new Promise(resolve => setTimeout(resolve, baseDelay));
+    }
+    
+    this.lastRequestTime = Date.now();
+    this.requestCount++;
+  }
+
+  private getRandomTimeout(): number {
+    // 随机超时时间：15-30秒
+    return Math.random() * 15000 + 15000;
+  }
+
+  private shouldRotateUserAgent(): boolean {
+    // 每5-15个请求轮换一次User-Agent
+    const rotationInterval = Math.random() * 10 + 5;
+    return this.requestCount % Math.floor(rotationInterval) === 0;
+  }
+
+  /**
+   * HTTP爬取方法
+   */
+  private async crawlPageWithHttp(url: string, settings: CrawlSettings = {}): Promise<CrawlResult> {
+    const maxRetries = 3;
+    const retryDelay = 2000;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        console.log(`HTTP爬取尝试 ${attempt}/${maxRetries}: ${url}`);
+        
+        // 应用智能延迟
+        await this.applyIntelligentDelay();
+        
+        // 根据策略决定是否轮换User-Agent
+        if (this.shouldRotateUserAgent() || attempt > 1) {
+          this.currentUserAgentIndex = (this.currentUserAgentIndex + 1) % this.userAgents.length;
+        }
+        
+        const headers = this.generateRealisticHeaders(url);
+        
+        const response = await axios.get(url, {
+          headers,
+          timeout: this.getRandomTimeout(),
+          maxRedirects: 5,
+          validateStatus: (status) => status < 400,
+          responseType: 'arraybuffer'
+        });
+        
+        // 处理压缩响应
+        let content: string;
+        const encoding = response.headers['content-encoding'];
+        
+        if (encoding === 'gzip') {
+          content = zlib.gunzipSync(response.data).toString('utf-8');
+        } else if (encoding === 'deflate') {
+          content = zlib.inflateSync(response.data).toString('utf-8');
+        } else {
+          content = response.data.toString('utf-8');
+        }
+        
+        // 使用Cheerio解析HTML
+        const $ = cheerio.load(content);
+        
+        // 提取标题
+        const title = $('title').text().trim() || $('h1').first().text().trim() || '';
+        
+        // 提取主要内容
+        const mainContent = this.extractMainContent($, url);
+        
+        // 提取图片链接
+        const images: string[] = [];
+        $('img[src]').each((_, element) => {
+          const src = $(element).attr('src');
+          if (src) {
+            try {
+              const imageUrl = new URL(src, url).href;
+              images.push(imageUrl);
+            } catch (e) {
+              // 忽略无效的URL
+            }
+          }
+        });
+        
+        // 提取链接
+        const links: string[] = [];
+        $('a[href]').each((_, element) => {
+          const href = $(element).attr('href');
+          if (href && href.startsWith('http')) {
+            links.push(href);
+          }
+        });
+        
+        return {
+          success: true,
+          content: mainContent,
+          title,
+          images: images.slice(0, 50),
+          links: links.slice(0, 100)
+        };
+        
+      } catch (error) {
+        console.error(`HTTP爬取错误 (尝试 ${attempt}):`, error);
+        
+        if (attempt === maxRetries) {
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : 'HTTP爬取失败'
+          };
+        }
+        
+        // 等待重试
+        await new Promise(resolve => setTimeout(resolve, retryDelay * attempt));
+      }
+    }
+    
+    return {
+      success: false,
+      error: '所有HTTP爬取尝试都失败了'
+    };
+  }
+
   async processCrawlTask(taskId: string, url: string, settings: CrawlSettings = {}): Promise<void> {
     try {
       // 更新任务状态为处理中
       await this.updateTaskStatus(taskId, 'processing');
       
-      // 执行爬取
-      const result = await this.crawlPage(url, settings);
+      // 检查robots.txt权限
+      const userAgent = this.getNextUserAgent();
+      const isAllowed = await robotsService.isUrlAllowed(url, userAgent);
+      if (!isAllowed) {
+        throw new Error(`URL被robots.txt禁止访问: ${url}`);
+      }
+
+      // 获取crawl-delay设置
+      const crawlDelay = await robotsService.getCrawlDelay(url, userAgent);
+      if (crawlDelay > 0) {
+        console.log(`遵守robots.txt crawl-delay: ${crawlDelay}ms for ${url}`);
+        await new Promise(resolve => setTimeout(resolve, crawlDelay));
+      }
+      
+      // 执行爬取 - 优先使用HTTP爬虫
+      let result: CrawlResult;
+      if (settings.useHttpCrawler) {
+        result = await this.crawlPageWithHttp(url, settings);
+      } else {
+        result = await this.crawlPage(url, settings);
+      }
       
       // 保存结果
       await this.saveResult(taskId, result);

@@ -20,6 +20,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import threading
+import glob
 
 # 配置日志
 logging.basicConfig(
@@ -124,7 +125,9 @@ class FailureReport:
 class ExcelBatchProcessor:
     """Excel批量处理器"""
     
-    def __init__(self, api_base_url: str = "http://localhost:3001", max_workers: int = 15, max_retries: int = 2, source_excel_name: str = None):
+    def __init__(self, api_base_url: str = "http://localhost:3001", max_workers: int = None, max_retries: int = 2, source_excel_name: str = None):
+        if max_workers is None:
+            max_workers = int(os.environ.get('EXCEL_MAX_WORKERS', '15'))
         self.api_base_url = api_base_url.rstrip('/')  # 移除末尾斜杠
         self.session = requests.Session()
         self.session.timeout = 300  # 5分钟超时
@@ -609,31 +612,133 @@ class ExcelBatchProcessor:
         
         return result
 
+def process_folder(folder_path: str, api_base_url: str = "http://localhost:3001") -> Dict:
+    """处理文件夹下所有Excel文件"""
+    results = {
+        'total_files': 0,
+        'processed_files': 0,
+        'failed_files': 0,
+        'file_results': [],
+        'overall_success': True
+    }
+    
+    try:
+        # 获取文件夹下所有Excel文件
+        excel_files = []
+        for file in os.listdir(folder_path):
+            if file.endswith('.xlsx') and not file.startswith('.~'):
+                excel_files.append(os.path.join(folder_path, file))
+        
+        if not excel_files:
+            print(f"错误: 文件夹 {folder_path} 中没有找到有效的Excel文件")
+            results['overall_success'] = False
+            return results
+        
+        results['total_files'] = len(excel_files)
+        print(f"找到 {len(excel_files)} 个Excel文件待处理")
+        
+        # 逐个处理Excel文件
+        for i, excel_path in enumerate(excel_files, 1):
+            excel_name = Path(excel_path).stem
+            print(f"\n正在处理第 {i}/{len(excel_files)} 个文件: {excel_name}")
+            
+            try:
+                processor = ExcelBatchProcessor(api_base_url, source_excel_name=excel_name)
+                result = processor.process_excel_file(excel_path)
+                
+                file_result = {
+                    'file_name': excel_name,
+                    'file_path': excel_path,
+                    'result': result
+                }
+                
+                results['file_results'].append(file_result)
+                
+                if result['success']:
+                    results['processed_files'] += 1
+                    print(f"✓ {excel_name} 处理成功: 总计{result['total_tasks']}, 成功{result['completed_tasks']}, 失败{result['failed_tasks']}")
+                else:
+                    results['failed_files'] += 1
+                    results['overall_success'] = False
+                    print(f"✗ {excel_name} 处理失败: {'; '.join(result['errors'])}")
+                    
+            except Exception as e:
+                results['failed_files'] += 1
+                results['overall_success'] = False
+                error_result = {
+                    'file_name': excel_name,
+                    'file_path': excel_path,
+                    'result': {
+                        'success': False,
+                        'total_tasks': 0,
+                        'completed_tasks': 0,
+                        'failed_tasks': 0,
+                        'zip_path': None,
+                        'errors': [str(e)]
+                    }
+                }
+                results['file_results'].append(error_result)
+                print(f"✗ {excel_name} 处理异常: {str(e)}")
+        
+        # 输出总结
+        print(f"\n=== 处理完成 ===")
+        print(f"总文件数: {results['total_files']}")
+        print(f"成功处理: {results['processed_files']}")
+        print(f"处理失败: {results['failed_files']}")
+        
+        return results
+        
+    except Exception as e:
+        print(f"处理文件夹异常: {str(e)}")
+        results['overall_success'] = False
+        return results
+
 def main():
     """主函数"""
     if len(sys.argv) < 2:
-        print("用法: python excel_batch_processor.py <excel_file_path> [api_base_url]")
+        print("用法: python excel_batch_processor.py <excel_file_or_folder_path> [api_base_url]")
+        print("支持处理单个Excel文件或文件夹下所有Excel文件")
         sys.exit(1)
     
-    excel_path = sys.argv[1]
+    input_path = sys.argv[1]
     api_base_url = sys.argv[2] if len(sys.argv) > 2 else "http://localhost:3001"
     
-    if not os.path.exists(excel_path):
-        print(f"错误: Excel文件不存在: {excel_path}")
+    if not os.path.exists(input_path):
+        print(f"错误: 路径不存在: {input_path}")
         sys.exit(1)
     
-    # 获取Excel文件名（不含扩展名）作为源文件标识
-    excel_name = Path(excel_path).stem
-    
-    processor = ExcelBatchProcessor(api_base_url, source_excel_name=excel_name)
-    result = processor.process_excel_file(excel_path)
-    
-    # 输出结果
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    
-    if result['success']:
-        sys.exit(0)
+    # 判断是文件还是文件夹
+    if os.path.isfile(input_path):
+        # 处理单个Excel文件
+        if not input_path.endswith('.xlsx'):
+            print(f"错误: 不是有效的Excel文件: {input_path}")
+            sys.exit(1)
+        
+        excel_name = Path(input_path).stem
+        processor = ExcelBatchProcessor(api_base_url, source_excel_name=excel_name)
+        result = processor.process_excel_file(input_path)
+        
+        # 输出结果
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        
+        if result['success']:
+            sys.exit(0)
+        else:
+            sys.exit(1)
+            
+    elif os.path.isdir(input_path):
+        # 处理文件夹下所有Excel文件
+        results = process_folder(input_path, api_base_url)
+        
+        # 输出详细结果
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+        
+        if results['overall_success']:
+            sys.exit(0)
+        else:
+            sys.exit(1)
     else:
+        print(f"错误: 无效的路径类型: {input_path}")
         sys.exit(1)
 
 if __name__ == "__main__":

@@ -1,8 +1,4 @@
-import dotenv from 'dotenv';
-
-// 首先加载环境变量
-dotenv.config();
-
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -14,10 +10,9 @@ import * as fs from 'fs';
 import tasksRouter from './routes/tasks.js';
 import settingsRouter from './routes/settings.js';
 import batchRouter from './routes/batch.js';
-import excelRouter from './routes/excel.js';
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 4000;
 
 // 确保临时目录存在
 const tempDir = path.join(process.cwd(), 'temp');
@@ -74,7 +69,6 @@ app.get('/api/health', (req, res) => {
 app.use('/api/tasks', tasksRouter);
 app.use('/api/settings', settingsRouter);
 app.use('/api/batch', batchRouter);
-app.use('/api/excel', excelRouter);
 
 // 静态文件服务（用于前端）
 if (process.env.NODE_ENV === 'production') {

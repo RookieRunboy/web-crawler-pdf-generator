@@ -2,7 +2,7 @@
   "watch": ["api"],
   "ext": "ts,js,json",
   "ignore": ["api/**/*.test.ts", "api/**/*.spec.ts"],
-  "exec": "tsx api/server.ts",
+  "exec": "tsx -r dotenv/config api/server.ts",
   "env": {
     "NODE_ENV": "development"
   },
