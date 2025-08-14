@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -11,7 +12,7 @@ import settingsRouter from './routes/settings.js';
 import batchRouter from './routes/batch.js';
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 4000;
 
 // 确保临时目录存在
 const tempDir = path.join(process.cwd(), 'temp');

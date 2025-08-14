@@ -1,312 +1,744 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Excel批量处理器
-用于读取Excel文件中的URL链接，批量创建爬取任务并下载PDF文件
+Excel批量爬取处理器
+用于读取Excel文件，提取URL并调用爬虫服务进行批量处理
 """
 
 import pandas as pd
-import requests
-import time
-import zipfile
 import os
 import sys
+import json
+import zipfile
+import requests
+import time
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
 import logging
 from urllib.parse import urlparse
-from typing import List, Dict, Optional
-import uuid
-from pathlib import Path
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+import threading
+import glob
 
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('excel_processor.log', encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
+        logging.FileHandler('excel_processor.log'),
+        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-class ExcelBatchProcessor:
-    def __init__(self, api_base_url: str = "http://localhost:3001"):
-        self.api_base_url = api_base_url.rstrip('/')
-        self.session = requests.Session()
-        self.session.timeout = 30
+class FailureReport:
+    """失败报告管理器"""
+    
+    def __init__(self, source_excel_name: str = None):
+        self.failures = []
+        self.lock = threading.Lock()
+        self.source_excel_name = source_excel_name
+    
+    def add_failure(self, title_link: str, title: str, reason: str, timestamp: str = None, source_excel: str = None):
+        """添加失败记录"""
+        if timestamp is None:
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
+        # 使用传入的源Excel文件名，如果没有则使用初始化时的名称
+        excel_source = source_excel or self.source_excel_name or "未知"
+        
+        with self.lock:
+            self.failures.append({
+                '标题链接': title_link,
+                '标题': title,
+                '失败原因': reason,
+                '失败时间': timestamp,
+                '源Excel文件': excel_source
+            })
+    
+    def generate_report(self, output_path: str) -> bool:
+        """生成失败报告Excel文件"""
+        try:
+            if not self.failures:
+                logger.info("没有失败记录，跳过生成失败报告")
+                return True
+            
+            df = pd.DataFrame(self.failures)
+            df.to_excel(output_path, index=False, engine='openpyxl')
+            logger.info(f"失败报告已生成: {output_path}")
+            return True
+        except Exception as e:
+            logger.error(f"生成失败报告失败: {str(e)}")
+            return False
+    
+    def append_to_global_summary(self, global_summary_path: str) -> bool:
+        """将失败记录追加到全局汇总文件"""
+        try:
+            if not self.failures:
+                logger.info("没有失败记录，跳过追加到全局汇总")
+                return True
+            
+            # 检查全局汇总文件是否存在
+            if os.path.exists(global_summary_path):
+                # 读取现有数据
+                try:
+                    existing_df = pd.read_excel(global_summary_path, engine='openpyxl')
+                    logger.info(f"读取现有全局汇总文件: {len(existing_df)}条记录")
+                except Exception as e:
+                    logger.warning(f"读取现有全局汇总文件失败，将创建新文件: {str(e)}")
+                    existing_df = pd.DataFrame()
+            else:
+                existing_df = pd.DataFrame()
+                logger.info("全局汇总文件不存在，将创建新文件")
+            
+            # 创建新的失败记录DataFrame
+            new_df = pd.DataFrame(self.failures)
+            
+            # 合并数据
+            if not existing_df.empty:
+                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+            else:
+                combined_df = new_df
+            
+            # 按时间排序
+            combined_df = combined_df.sort_values('失败时间', ascending=False)
+            
+            # 保存到全局汇总文件
+            combined_df.to_excel(global_summary_path, index=False, engine='openpyxl')
+            logger.info(f"全局失败汇总已更新: {global_summary_path} (新增{len(self.failures)}条，总计{len(combined_df)}条)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"追加到全局汇总失败: {str(e)}")
+            return False
+    
+    def get_failure_count(self) -> int:
+        """获取失败数量"""
+        return len(self.failures)
+    
+    def get_failure_summary(self) -> List[str]:
+        """获取失败摘要"""
+        return [f"{f['标题']}: {f['失败原因']}" for f in self.failures]
+
+class ExcelBatchProcessor:
+    """Excel批量处理器"""
+    
+    def __init__(self, api_base_url: str = "http://localhost:3001", max_workers: int = None, max_retries: int = 2, source_excel_name: str = None):
+        if max_workers is None:
+            max_workers = int(os.environ.get('EXCEL_MAX_WORKERS', '15'))
+        self.api_base_url = api_base_url.rstrip('/')  # 移除末尾斜杠
+        self.session = requests.Session()
+        self.session.timeout = 300  # 5分钟超时
+        self.max_workers = max_workers  # 并发线程数
+        self.max_retries = max_retries  # 最大重试次数
+        self.failure_report = FailureReport(source_excel_name)  # 失败报告管理器
+        
+        # 设置连接池和重试策略
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        
+        # 测试API连接
+        self._test_api_connection()
+    
+    def _test_api_connection(self):
+        """测试API连接"""
+        try:
+            response = self.session.get(f"{self.api_base_url}/api/health", timeout=10)
+            if response.status_code == 200:
+                logger.info(f"API连接测试成功: {self.api_base_url}")
+            else:
+                logger.warning(f"API连接测试失败 (HTTP {response.status_code}): {self.api_base_url}")
+        except Exception as e:
+            logger.warning(f"API连接测试异常: {str(e)}")
+        
+    def clean_filename(self, filename: str) -> str:
+        """清理文件名，移除不安全字符"""
+        if not filename:
+            return "untitled"
+        
+        # 移除控制字符和不安全字符
+        cleaned = re.sub(r'[\x00-\x1f\x7f-\xff]', '', filename)
+        cleaned = re.sub(r'["\\/:*?<>|\r\n\t\v\f]', '_', cleaned)
+        
+        # 确保文件名不为空且长度合理
+        if not cleaned or len(cleaned.strip()) == 0:
+            return "untitled"
+        
+        return cleaned.strip()[:100]  # 限制长度
+    
+    def read_excel_file(self, excel_path: str) -> pd.DataFrame:
+        """读取Excel文件"""
+        try:
+            logger.info(f"正在读取Excel文件: {excel_path}")
+            
+            # 尝试读取Excel文件
+            df = pd.read_excel(excel_path)
+            
+            # 检查必需的列
+            if '标题链接' not in df.columns:
+                raise ValueError("Excel文件中未找到'标题链接'列")
+            
+            # 检查标题列是否存在（可选）
+            has_title = '标题' in df.columns
+            if has_title:
+                logger.info("发现标题列，将用作文件名")
+            else:
+                logger.info("未发现标题列，将使用URL作为文件名")
+            
+            logger.info(f"成功读取Excel文件，共{len(df)}行数据")
+            return df
+            
+        except Exception as e:
+            logger.error(f"读取Excel文件失败: {str(e)}")
+            raise
+    
+    def fix_url_format(self, url: str) -> str:
+        """修复URL格式问题"""
+        if not url or pd.isna(url):
+            return url
+        
+        original_url = str(url).strip()
+        if not original_url:
+            return original_url
+        
+        fixed_url = original_url
+        
+        # 修复常见的URL格式问题
+        if original_url.startswith('https:/') and not original_url.startswith('https://'):
+            # 处理 https:/ -> https://
+            fixed_url = original_url.replace('https:/', 'https://', 1)
+            logger.info(f"修复URL: {original_url} -> {fixed_url}")
+        elif original_url.startswith('http:/') and not original_url.startswith('http://'):
+            # 处理 http:/ -> http://
+            fixed_url = original_url.replace('http:/', 'http://', 1)
+            logger.info(f"修复URL: {original_url} -> {fixed_url}")
+        elif original_url.startswith('https/') and not original_url.startswith('https://'):
+            # 处理 https/ -> https://
+            fixed_url = original_url.replace('https/', 'https://', 1)
+            logger.info(f"修复URL: {original_url} -> {fixed_url}")
+        elif original_url.startswith('http/') and not original_url.startswith('http://'):
+            # 处理 http/ -> http://
+            fixed_url = original_url.replace('http/', 'http://', 1)
+            logger.info(f"修复URL: {original_url} -> {fixed_url}")
+            
+        return fixed_url
+    
     def validate_url(self, url: str) -> bool:
         """验证URL格式"""
+        if not url or pd.isna(url):
+            return False
+        
+        url = str(url).strip()
+        if not url:
+            return False
+            
+        # 检查URL格式
         try:
             result = urlparse(url)
             return all([result.scheme, result.netloc])
         except Exception:
             return False
     
-    def read_excel_file(self, excel_file_path: str) -> List[str]:
-        """读取Excel文件并提取URL链接"""
-        try:
-            # 尝试读取Excel文件
-            df = pd.read_excel(excel_file_path)
-            logger.info(f"成功读取Excel文件: {excel_file_path}")
-            logger.info(f"文件包含 {len(df)} 行数据")
-            logger.info(f"列名: {list(df.columns)}")
-            
-            # 查找包含链接的列
-            url_column = None
-            for col in df.columns:
-                if '链接' in str(col) or 'url' in str(col).lower() or 'link' in str(col).lower():
-                    url_column = col
-                    break
-            
-            if url_column is None:
-                # 如果没有找到明确的链接列，尝试第一列
-                url_column = df.columns[0]
-                logger.warning(f"未找到明确的链接列，使用第一列: {url_column}")
-            else:
-                logger.info(f"找到链接列: {url_column}")
-            
-            # 提取URL
-            urls = []
-            for idx, url in enumerate(df[url_column]):
-                if pd.notna(url) and str(url).strip():
-                    url_str = str(url).strip()
-                    if self.validate_url(url_str):
-                        urls.append(url_str)
-                    else:
-                        logger.warning(f"第{idx+1}行URL格式无效: {url_str}")
-            
-            logger.info(f"提取到 {len(urls)} 个有效URL")
-            return urls
-            
-        except Exception as e:
-            logger.error(f"读取Excel文件失败: {e}")
-            raise
-    
-    def create_crawl_task(self, url: str) -> Optional[str]:
+    def create_crawl_task(self, url: str, title: str) -> Optional[str]:
         """创建爬取任务"""
         try:
             payload = {
                 "url": url,
+                "title": title,
                 "options": {
-                    "waitTime": 3000,
-                    "generatePdf": True
+                    "includeImages": True,
+                    "timeout": 30
                 }
             }
             
             response = self.session.post(
                 f"{self.api_base_url}/api/tasks/create",
                 json=payload,
-                timeout=30
+                headers={'Content-Type': 'application/json'}
             )
             
             if response.status_code == 200:
-                data = response.json()
-                if data.get('success'):
-                    task_id = data.get('taskId')
-                    logger.info(f"成功创建任务: {task_id} for URL: {url}")
+                result = response.json()
+                if result.get('success'):
+                    task_id = result.get('data', {}).get('taskId')
+                    logger.info(f"创建爬取任务成功: {task_id} - {title}")
                     return task_id
-                else:
-                    logger.error(f"创建任务失败: {data.get('error', '未知错误')}")
-            else:
-                logger.error(f"创建任务HTTP错误: {response.status_code}")
-                
-        except Exception as e:
-            logger.error(f"创建任务异常: {e}")
-        
-        return None
-    
-    def get_task_status(self, task_id: str) -> Dict:
-        """获取任务状态"""
-        try:
-            response = self.session.get(
-                f"{self.api_base_url}/api/tasks/status/{task_id}",
-                timeout=30
-            )
             
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logger.warning(f"获取任务状态失败: HTTP {response.status_code}")
-                return {"success": False, "error": f"HTTP {response.status_code}"}
-                
+            error_msg = f"HTTP {response.status_code}: {response.text}"
+            logger.error(f"创建爬取任务失败: {error_msg}")
+            return None
+            
         except Exception as e:
-            logger.warning(f"获取任务状态异常: {e}")
-            return {"success": False, "error": str(e)}
+            error_msg = f"网络异常: {str(e)}"
+            logger.error(f"创建爬取任务异常: {error_msg}")
+            return None
     
     def wait_for_task_completion(self, task_id: str, max_wait_time: int = 300) -> bool:
         """等待任务完成"""
         start_time = time.time()
+        retry_count = 0
+        max_retries = 3
         
         while time.time() - start_time < max_wait_time:
-            status_data = self.get_task_status(task_id)
-            
-            if status_data.get('success'):
-                task_status = status_data.get('task', {}).get('status')
+            try:
+                # 添加重试机制
+                response = self.session.get(
+                    f"{self.api_base_url}/api/tasks/status/{task_id}",
+                    timeout=30
+                )
                 
-                if task_status == 'completed':
-                    logger.info(f"任务 {task_id} 已完成")
-                    return True
-                elif task_status == 'failed':
-                    logger.error(f"任务 {task_id} 失败")
+                if response.status_code == 200:
+                    result = response.json()
+                    if result.get('success'):
+                        task_data = result.get('data', {})
+                        status = task_data.get('status')
+                        
+                        if status == 'completed':
+                            logger.info(f"任务 {task_id} 完成")
+                            return True
+                        elif status == 'failed':
+                            error_msg = task_data.get('errorMessage', '未知错误')
+                            logger.error(f"任务 {task_id} 失败: {error_msg}")
+                            return False
+                        elif status in ['pending', 'processing']:
+                            logger.info(f"任务 {task_id} 状态: {status}")
+                            time.sleep(10)  # 增加等待时间
+                            retry_count = 0  # 重置重试计数
+                            continue
+                elif response.status_code == 404:
+                    logger.error(f"任务 {task_id} 不存在")
                     return False
                 else:
-                    logger.info(f"任务 {task_id} 状态: {task_status}，继续等待...")
-            else:
-                logger.warning(f"获取任务状态失败: {status_data.get('error', '未知错误')}")
+                    logger.warning(f"获取任务状态失败 (HTTP {response.status_code}): {response.text}")
+                
+            except requests.exceptions.Timeout:
+                logger.warning(f"请求超时，重试中... ({retry_count + 1}/{max_retries})")
+                retry_count += 1
+                if retry_count >= max_retries:
+                    logger.error(f"任务 {task_id} 请求超时次数过多")
+                    return False
+            except requests.exceptions.ConnectionError:
+                logger.warning(f"连接错误，重试中... ({retry_count + 1}/{max_retries})")
+                retry_count += 1
+                if retry_count >= max_retries:
+                    logger.error(f"任务 {task_id} 连接失败")
+                    return False
+            except Exception as e:
+                logger.error(f"检查任务状态异常: {str(e)}")
+                retry_count += 1
+                if retry_count >= max_retries:
+                    return False
             
-            time.sleep(5)
+            time.sleep(min(5 * (retry_count + 1), 30))  # 指数退避
         
-        logger.error(f"任务 {task_id} 等待超时")
+        logger.error(f"任务 {task_id} 超时")
         return False
     
-    def download_pdf(self, task_id: str, output_dir: str) -> Optional[str]:
+    def download_pdf(self, task_id: str, output_path: str) -> bool:
         """下载PDF文件"""
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                response = self.session.get(
+                    f"{self.api_base_url}/api/tasks/download/{task_id}",
+                    timeout=60,
+                    stream=True
+                )
+                
+                if response.status_code == 200:
+                    # 流式下载大文件
+                    with open(output_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    
+                    # 验证文件是否下载完整
+                    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                        logger.info(f"PDF下载成功: {output_path}")
+                        return True
+                    else:
+                        logger.error(f"PDF文件下载不完整: {output_path}")
+                        if os.path.exists(output_path):
+                            os.remove(output_path)
+                        
+                elif response.status_code == 404:
+                    logger.error(f"PDF文件不存在 (任务ID: {task_id})")
+                    return False
+                else:
+                    logger.error(f"PDF下载失败 (HTTP {response.status_code}): {response.text}")
+                    
+            except requests.exceptions.Timeout:
+                logger.warning(f"PDF下载超时，重试中... ({retry_count + 1}/{max_retries})")
+            except requests.exceptions.ConnectionError:
+                logger.warning(f"PDF下载连接错误，重试中... ({retry_count + 1}/{max_retries})")
+            except Exception as e:
+                logger.error(f"PDF下载异常: {str(e)}")
+                
+            retry_count += 1
+            if retry_count < max_retries:
+                time.sleep(5 * retry_count)  # 指数退避
+        
+        logger.error(f"PDF下载失败，已重试{max_retries}次")
+        return False
+    
+    def process_single_url(self, url: str, title: str, output_dir: str) -> Tuple[bool, str, str]:
+        """处理单个URL的完整流程
+        
+        Returns:
+            Tuple[bool, str, str]: (成功标志, PDF文件路径或错误信息, 详细错误信息)
+        """
+        clean_filename = self.clean_filename(title)
+        pdf_filename = f"{clean_filename}.pdf"
+        pdf_path = os.path.join(output_dir, pdf_filename)
+        
         try:
-            response = self.session.get(
-                f"{self.api_base_url}/api/tasks/download/{task_id}",
-                timeout=60,
-                stream=True
-            )
-            
-            if response.status_code == 200:
-                # 从响应头获取文件名
-                content_disposition = response.headers.get('content-disposition', '')
-                filename = f"{task_id}.pdf"
-                
-                if 'filename=' in content_disposition:
-                    filename = content_disposition.split('filename=')[1].strip('"')
-                
-                file_path = os.path.join(output_dir, filename)
-                
-                with open(file_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                
-                logger.info(f"成功下载PDF: {file_path}")
-                return file_path
-            else:
-                logger.error(f"下载PDF失败: HTTP {response.status_code}")
-                
-        except Exception as e:
-            logger.error(f"下载PDF异常: {e}")
-        
-        return None
-    
-    def create_zip_file(self, pdf_files: List[str], excel_filename: str, output_dir: str) -> str:
-        """创建ZIP文件"""
-        # 从Excel文件名生成ZIP文件名
-        base_name = os.path.splitext(os.path.basename(excel_filename))[0]
-        zip_filename = f"{base_name}.zip"
-        zip_path = os.path.join(output_dir, zip_filename)
-        
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for pdf_file in pdf_files:
-                if os.path.exists(pdf_file):
-                    arcname = os.path.basename(pdf_file)
-                    zipf.write(pdf_file, arcname)
-                    logger.info(f"添加文件到ZIP: {arcname}")
-        
-        logger.info(f"创建ZIP文件: {zip_path}")
-        return zip_path
-    
-    def process_excel_file(self, excel_file_path: str, output_dir: str) -> Dict:
-        """处理Excel文件的主要方法"""
-        logger.info(f"开始处理Excel文件: {excel_file_path}")
-        
-        # 确保输出目录存在
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # 读取Excel文件
-        urls = self.read_excel_file(excel_file_path)
-        
-        if not urls:
-            logger.error("未找到有效的URL")
-            return {"success": False, "error": "未找到有效的URL"}
-        
-        # 创建任务并处理
-        successful_downloads = []
-        failed_tasks = []
-        
-        for i, url in enumerate(urls, 1):
-            logger.info(f"处理第 {i}/{len(urls)} 个URL: {url}")
-            
             # 创建爬取任务
-            task_id = self.create_crawl_task(url)
+            task_id = self.create_crawl_task(url, title)
             if not task_id:
-                failed_tasks.append({"url": url, "error": "创建任务失败"})
-                continue
+                error_msg = "创建爬取任务失败"
+                self.failure_report.add_failure(url, title, error_msg)
+                return False, error_msg, error_msg
             
             # 等待任务完成
-            if self.wait_for_task_completion(task_id):
-                # 下载PDF
-                pdf_path = self.download_pdf(task_id, output_dir)
-                if pdf_path:
-                    successful_downloads.append(pdf_path)
-                else:
-                    failed_tasks.append({"url": url, "task_id": task_id, "error": "下载PDF失败"})
+            if not self.wait_for_task_completion(task_id):
+                error_msg = "任务超时或执行失败"
+                self.failure_report.add_failure(url, title, error_msg)
+                return False, error_msg, error_msg
+            
+            # 下载PDF
+            if self.download_pdf(task_id, pdf_path):
+                logger.info(f"成功处理URL: {title}")
+                return True, pdf_path, ""
             else:
-                failed_tasks.append({"url": url, "task_id": task_id, "error": "任务执行失败或超时"})
-        
-        # 创建ZIP文件
-        zip_path = None
-        if successful_downloads:
-            zip_path = self.create_zip_file(successful_downloads, excel_file_path, output_dir)
-        
-        # 返回处理结果
+                error_msg = "PDF下载失败"
+                self.failure_report.add_failure(url, title, error_msg)
+                return False, error_msg, error_msg
+                
+        except Exception as e:
+            error_msg = f"处理异常: {str(e)}"
+            logger.error(f"处理URL异常: {title} - {error_msg}")
+            self.failure_report.add_failure(url, title, error_msg)
+            return False, error_msg, error_msg
+    
+    def create_zip_file(self, pdf_files: List[str], zip_path: str, failure_report_path: str = None) -> bool:
+        """创建ZIP压缩文件，包含PDF文件和失败报告"""
+        try:
+            logger.info(f"正在创建ZIP文件: {zip_path}")
+            
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                # 添加PDF文件
+                for pdf_file in pdf_files:
+                    if os.path.exists(pdf_file):
+                        # 使用文件名作为ZIP内的路径
+                        arcname = os.path.basename(pdf_file)
+                        zipf.write(pdf_file, arcname)
+                        logger.info(f"添加PDF文件到ZIP: {arcname}")
+                
+                # 添加失败报告文件
+                if failure_report_path and os.path.exists(failure_report_path):
+                    arcname = os.path.basename(failure_report_path)
+                    zipf.write(failure_report_path, arcname)
+                    logger.info(f"添加失败报告到ZIP: {arcname}")
+            
+            logger.info(f"ZIP文件创建成功: {zip_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"创建ZIP文件失败: {str(e)}")
+            return False
+    
+    def process_excel_file(self, excel_path: str) -> Dict:
+        """处理Excel文件的主要方法"""
         result = {
-            "success": True,
-            "total_urls": len(urls),
-            "successful_downloads": len(successful_downloads),
-            "failed_tasks": len(failed_tasks),
-            "zip_file": zip_path,
-            "pdf_files": successful_downloads,
-            "failures": failed_tasks
+            'success': False,
+            'total_tasks': 0,
+            'completed_tasks': 0,
+            'failed_tasks': 0,
+            'zip_path': None,
+            'errors': []
         }
         
-        logger.info(f"处理完成: 成功 {len(successful_downloads)}/{len(urls)}")
-        if failed_tasks:
-            logger.warning(f"失败的任务: {len(failed_tasks)}")
-            for failure in failed_tasks:
-                logger.warning(f"  - {failure['url']}: {failure['error']}")
+        try:
+            # 读取Excel文件
+            df = self.read_excel_file(excel_path)
+            
+            # 过滤有效的URL
+            valid_rows = []
+            for index, row in df.iterrows():
+                original_url = str(row['标题链接']).strip()
+                
+                # 修复URL格式问题
+                fixed_url = self.fix_url_format(original_url)
+                
+                # 使用标题作为文件名，如果不存在则使用URL
+                if '标题' in df.columns and pd.notna(row['标题']):
+                    filename = str(row['标题']).strip()
+                else:
+                    filename = fixed_url
+                
+                # 添加详细的调试信息
+                logger.info(f"处理行 {index + 1}: 原始URL='{original_url}', 修复后URL='{fixed_url}'")
+                
+                # 验证修复后的URL
+                is_valid = self.validate_url(fixed_url)
+                logger.info(f"URL验证结果 (行 {index + 1}): {is_valid}")
+                
+                if is_valid:
+                    valid_rows.append({
+                        'index': index,
+                        'url': fixed_url,  # 使用修复后的URL
+                        'filename': filename
+                    })
+                    if fixed_url != original_url:
+                        logger.info(f"URL已修复 (行 {index + 1}): {original_url} -> {fixed_url}")
+                else:
+                    logger.warning(f"跳过无效URL (行 {index + 1}): {original_url}")
+                    self.failure_report.add_failure(original_url, filename, "无效的URL格式")
+            
+            result['total_tasks'] = len(valid_rows)
+            
+            if not valid_rows:
+                result['errors'].append("没有找到有效的URL")
+                return result
+            
+            # 固定输出目录为项目根目录下的exceloutput文件夹
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(os.path.dirname(script_dir))
+            output_dir = os.path.join(project_root, 'exceloutput')
+            
+            # 确保输出目录存在
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # 使用并行处理
+            pdf_files = []
+            
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # 提交所有任务
+                future_to_data = {
+                    executor.submit(self.process_single_url, row_data['url'], row_data['filename'], output_dir): row_data
+                    for row_data in valid_rows
+                }
+                
+                # 收集结果
+                for i, future in enumerate(as_completed(future_to_data), 1):
+                    row_data = future_to_data[future]
+                    logger.info(f"处理进度: {i}/{len(valid_rows)}")
+                    
+                    try:
+                        success, pdf_path_or_error, detailed_error = future.result()
+                        
+                        if success:
+                            pdf_files.append(pdf_path_or_error)
+                            result['completed_tasks'] += 1
+                            logger.info(f"任务完成: {row_data['filename']}")
+                        else:
+                            result['failed_tasks'] += 1
+                            result['errors'].append(f"{row_data['filename']}: {pdf_path_or_error}")
+                            
+                    except Exception as e:
+                        result['failed_tasks'] += 1
+                        error_msg = f"并行处理异常: {str(e)}"
+                        result['errors'].append(f"{row_data['filename']}: {error_msg}")
+                        self.failure_report.add_failure(row_data['url'], row_data['filename'], error_msg)
+            
+            # 生成失败报告
+            failure_report_path = None
+            if self.failure_report.failures:
+                excel_name = Path(excel_path).stem
+                failure_report_filename = f"{excel_name}_failure_report.xlsx"
+                failure_report_path = os.path.join(output_dir, failure_report_filename)
+                
+                if self.failure_report.generate_report(failure_report_path):
+                    logger.info(f"失败报告已生成: {failure_report_path}")
+                else:
+                    logger.error("失败报告生成失败")
+                    result['errors'].append("失败报告生成失败")
+                
+                # 追加到全局失败汇总文件
+                global_summary_path = os.path.join(output_dir, "failure_summary.xlsx")
+                if self.failure_report.append_to_global_summary(global_summary_path):
+                    logger.info(f"已追加到全局失败汇总: {global_summary_path}")
+                else:
+                    logger.error("追加到全局失败汇总失败")
+                    result['errors'].append("追加到全局失败汇总失败")
+            
+            # 创建ZIP文件
+            if pdf_files or failure_report_path:
+                excel_name = Path(excel_path).stem
+                zip_filename = f"{excel_name}.zip"
+                zip_path = os.path.join(output_dir, zip_filename)
+                
+                if self.create_zip_file(pdf_files, zip_path, failure_report_path):
+                    result['zip_path'] = zip_path
+                    result['success'] = True
+                    
+                    # 清理临时文件
+                    for pdf_file in pdf_files:
+                        try:
+                            os.remove(pdf_file)
+                        except:
+                            pass
+                    
+                    # 清理失败报告文件
+                    if failure_report_path and os.path.exists(failure_report_path):
+                        try:
+                            os.remove(failure_report_path)
+                        except:
+                            pass
+                else:
+                    result['errors'].append("ZIP文件创建失败")
+            else:
+                result['errors'].append("没有成功的PDF文件或失败报告可打包")
+            
+            logger.info(f"处理完成: 总计{result['total_tasks']}, 成功{result['completed_tasks']}, 失败{result['failed_tasks']}")
+            
+        except Exception as e:
+            logger.error(f"处理Excel文件异常: {str(e)}")
+            result['errors'].append(str(e))
         
         return result
 
-def main():
-    """主函数"""
-    if len(sys.argv) < 3:
-        print("使用方法: python excel_batch_processor.py <excel_file_path> <output_dir> [api_base_url]")
-        print("示例: python excel_batch_processor.py data.xlsx ./downloads http://localhost:3001")
-        sys.exit(1)
-    
-    excel_file_path = sys.argv[1]
-    output_dir = sys.argv[2]
-    api_base_url = sys.argv[3] if len(sys.argv) > 3 else "http://localhost:3001"
-    
-    # 检查Excel文件是否存在
-    if not os.path.exists(excel_file_path):
-        logger.error(f"Excel文件不存在: {excel_file_path}")
-        sys.exit(1)
-    
-    # 创建处理器并执行
-    processor = ExcelBatchProcessor(api_base_url)
+def process_folder(folder_path: str, api_base_url: str = "http://localhost:3001") -> Dict:
+    """处理文件夹下所有Excel文件"""
+    results = {
+        'total_files': 0,
+        'processed_files': 0,
+        'failed_files': 0,
+        'file_results': [],
+        'overall_success': True
+    }
     
     try:
-        result = processor.process_excel_file(excel_file_path, output_dir)
+        # 获取文件夹下所有Excel文件
+        excel_files = []
+        for file in os.listdir(folder_path):
+            if file.endswith('.xlsx') and not file.startswith('.~'):
+                excel_files.append(os.path.join(folder_path, file))
         
-        if result["success"]:
-            print(f"\n处理完成!")
-            print(f"总URL数: {result['total_urls']}")
-            print(f"成功下载: {result['successful_downloads']}")
-            print(f"失败任务: {result['failed_tasks']}")
-            if result['zip_file']:
-                print(f"ZIP文件: {result['zip_file']}")
+        if not excel_files:
+            print(f"错误: 文件夹 {folder_path} 中没有找到有效的Excel文件")
+            results['overall_success'] = False
+            return results
+        
+        results['total_files'] = len(excel_files)
+        print(f"找到 {len(excel_files)} 个Excel文件待处理")
+        
+        # 逐个处理Excel文件
+        for i, excel_path in enumerate(excel_files, 1):
+            excel_name = Path(excel_path).stem
+            print(f"\n正在处理第 {i}/{len(excel_files)} 个文件: {excel_name}")
+            
+            try:
+                processor = ExcelBatchProcessor(api_base_url, source_excel_name=excel_name)
+                result = processor.process_excel_file(excel_path)
+                
+                file_result = {
+                    'file_name': excel_name,
+                    'file_path': excel_path,
+                    'result': result
+                }
+                
+                results['file_results'].append(file_result)
+                
+                if result['success']:
+                    results['processed_files'] += 1
+                    print(f"✓ {excel_name} 处理成功: 总计{result['total_tasks']}, 成功{result['completed_tasks']}, 失败{result['failed_tasks']}")
+                else:
+                    results['failed_files'] += 1
+                    results['overall_success'] = False
+                    print(f"✗ {excel_name} 处理失败: {'; '.join(result['errors'])}")
+                    
+            except Exception as e:
+                results['failed_files'] += 1
+                results['overall_success'] = False
+                error_result = {
+                    'file_name': excel_name,
+                    'file_path': excel_path,
+                    'result': {
+                        'success': False,
+                        'total_tasks': 0,
+                        'completed_tasks': 0,
+                        'failed_tasks': 0,
+                        'zip_path': None,
+                        'errors': [str(e)]
+                    }
+                }
+                results['file_results'].append(error_result)
+                print(f"✗ {excel_name} 处理异常: {str(e)}")
+        
+        # 输出总结
+        print(f"\n=== 处理完成 ===")
+        print(f"总文件数: {results['total_files']}")
+        print(f"成功处理: {results['processed_files']}")
+        print(f"处理失败: {results['failed_files']}")
+        
+        return results
+        
+    except Exception as e:
+        print(f"处理文件夹异常: {str(e)}")
+        results['overall_success'] = False
+        return results
+
+def main():
+    """主函数"""
+    if len(sys.argv) < 2:
+        print("用法: python excel_batch_processor.py <excel_file_or_folder_path> [api_base_url]")
+        print("支持处理单个Excel文件或文件夹下所有Excel文件")
+        sys.exit(1)
+    
+    input_path = sys.argv[1]
+    api_base_url = sys.argv[2] if len(sys.argv) > 2 else "http://localhost:3001"
+    
+    if not os.path.exists(input_path):
+        print(f"错误: 路径不存在: {input_path}")
+        sys.exit(1)
+    
+    # 判断是文件还是文件夹
+    if os.path.isfile(input_path):
+        # 处理单个Excel文件
+        if not input_path.endswith('.xlsx'):
+            print(f"错误: 不是有效的Excel文件: {input_path}")
+            sys.exit(1)
+        
+        excel_name = Path(input_path).stem
+        processor = ExcelBatchProcessor(api_base_url, source_excel_name=excel_name)
+        result = processor.process_excel_file(input_path)
+        
+        # 输出结果
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        
+        if result['success']:
+            sys.exit(0)
         else:
-            print(f"处理失败: {result['error']}")
             sys.exit(1)
             
-    except Exception as e:
-        logger.error(f"程序执行异常: {e}")
+    elif os.path.isdir(input_path):
+        # 处理文件夹下所有Excel文件
+        results = process_folder(input_path, api_base_url)
+        
+        # 输出详细结果
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+        
+        if results['overall_success']:
+            sys.exit(0)
+        else:
+            sys.exit(1)
+    else:
+        print(f"错误: 无效的路径类型: {input_path}")
         sys.exit(1)
 
 if __name__ == "__main__":
