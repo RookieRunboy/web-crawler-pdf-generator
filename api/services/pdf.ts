@@ -204,7 +204,6 @@ class PDFService {
     </div>
     <div class="footer">
         <p>生成时间: ${new Date().toLocaleString('zh-CN')}</p>
-        <p>由网页爬虫PDF生成器创建</p>
     </div>
 </body>
 </html>
@@ -242,13 +241,7 @@ class PDFService {
           bottom: '20mm',
           left: '15mm'
         },
-        displayHeaderFooter: true,
-        headerTemplate: '<div></div>',
-        footerTemplate: `
-          <div style="font-size: 10px; text-align: center; width: 100%; color: #666;">
-            <span class="pageNumber"></span> / <span class="totalPages"></span>
-          </div>
-        `
+        displayHeaderFooter: false
       };
       
       // 生成文件名 - 基于任务标题
