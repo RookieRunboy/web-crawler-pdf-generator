@@ -10,6 +10,7 @@ import { fileURLToPath } from 'url';
 import authRoutes from './routes/auth.js';
 import tasksRoutes from './routes/tasks.js';
 import settingsRoutes from './routes/settings.js';
+import excelRoutes from './routes/excel.js';
 
 // for esm mode
 const __filename = fileURLToPath(import.meta.url);
@@ -31,6 +32,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use('/api/auth', authRoutes);
 app.use('/api/tasks', tasksRoutes);
 app.use('/api/settings', settingsRoutes);
+app.use('/api/excel', excelRoutes);
 
 /**
  * health

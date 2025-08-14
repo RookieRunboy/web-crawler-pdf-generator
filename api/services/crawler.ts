@@ -1,5 +1,12 @@
-import puppeteer, { Browser, Page } from 'puppeteer';
+import puppeteer from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import { Browser, Page } from 'puppeteer';
 import * as cheerio from 'cheerio';
+import fs from 'fs';
+import path from 'path';
+
+// 使用stealth插件
+puppeteer.use(StealthPlugin());
 import { supabaseAdmin } from '../config/supabase.js';
 
 export interface CrawlSettings {
@@ -21,29 +28,172 @@ export interface CrawlResult {
 
 class CrawlerService {
   private browser: Browser | null = null;
+  private pagePool: Page[] = [];
+  private maxPoolSize: number = 5;
+  private currentPoolSize: number = 0;
+  private browserHealthy: boolean = true;
+  private lastHealthCheck: number = 0;
+  private healthCheckInterval: number = 30000; // 30秒
 
   async initBrowser(): Promise<void> {
     if (!this.browser) {
-      this.browser = await puppeteer.launch({
-        headless: true,
+      try {
+        console.log('Initializing browser with enhanced stability configuration...');
+        this.browser = await puppeteer.launch({
+        headless: 'new',
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
+          '--disable-gpu',
           '--no-first-run',
-          '--no-zygote',
-          '--single-process',
-          '--disable-gpu'
-        ]
+          '--disable-features=TranslateUI',
+          '--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        ],
+        defaultViewport: {
+          width: 1920,
+          height: 1080,
+        },
+        timeout: 60000,
       });
+        console.log('Browser initialized successfully');
+      } catch (error) {
+        console.error('Failed to initialize browser:', error);
+        this.browser = null;
+        throw new Error(`Browser initialization failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
     }
   }
 
   async closeBrowser(): Promise<void> {
+    // 关闭所有页面池中的页面
+    for (const page of this.pagePool) {
+      try {
+        if (!page.isClosed()) {
+          await page.close();
+        }
+      } catch (error) {
+        console.error('Error closing pooled page:', error);
+      }
+    }
+    this.pagePool = [];
+    this.currentPoolSize = 0;
+    
     if (this.browser) {
-      await this.browser.close();
+      try {
+        await this.browser.close();
+      } catch (error) {
+        console.error('Error closing browser:', error);
+      }
       this.browser = null;
+    }
+    this.browserHealthy = true;
+  }
+
+  /**
+   * 从页面池获取页面，如果池为空则创建新页面
+   */
+  private async getPageFromPool(): Promise<Page> {
+    // 健康检查
+    await this.checkBrowserHealth();
+    
+    // 尝试从池中获取可用页面
+    while (this.pagePool.length > 0) {
+      const page = this.pagePool.pop()!;
+      try {
+        if (!page.isClosed()) {
+          // 重置页面状态
+          await page.goto('about:blank');
+          return page;
+        }
+      } catch (error) {
+        console.warn('Pooled page is unusable, discarding:', error);
+        this.currentPoolSize--;
+      }
+    }
+    
+    // 池中没有可用页面，创建新页面
+    if (!this.browser) {
+      await this.initBrowser();
+    }
+    
+    if (!this.browser) {
+      throw new Error('Browser not available');
+    }
+    
+    const page = await this.browser.newPage();
+    this.currentPoolSize++;
+    console.log(`Created new page, pool size: ${this.currentPoolSize}`);
+    return page;
+  }
+
+  /**
+   * 将页面返回到池中
+   */
+  private async returnPageToPool(page: Page): Promise<void> {
+    try {
+      if (page.isClosed()) {
+        this.currentPoolSize--;
+        return;
+      }
+      
+      // 如果池已满，关闭页面
+      if (this.pagePool.length >= this.maxPoolSize) {
+        await page.close();
+        this.currentPoolSize--;
+        console.log(`Pool full, closed page. Pool size: ${this.currentPoolSize}`);
+        return;
+      }
+      
+      // 清理页面状态
+      await page.setRequestInterception(false);
+      await page.removeAllListeners();
+      
+      // 返回到池中
+      this.pagePool.push(page);
+      console.log(`Returned page to pool, pool size: ${this.pagePool.length}`);
+    } catch (error) {
+      console.error('Error returning page to pool:', error);
+      try {
+        await page.close();
+      } catch (closeError) {
+        console.error('Error closing page:', closeError);
+      }
+      this.currentPoolSize--;
+    }
+  }
+
+  /**
+   * 检查浏览器健康状态
+   */
+  private async checkBrowserHealth(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastHealthCheck < this.healthCheckInterval) {
+      return;
+    }
+    
+    this.lastHealthCheck = now;
+    
+    if (!this.browser) {
+      this.browserHealthy = false;
+      return;
+    }
+    
+    try {
+      // 简单的健康检查：获取浏览器版本
+      await this.browser.version();
+      this.browserHealthy = true;
+    } catch (error) {
+      console.warn('Browser health check failed:', error);
+      this.browserHealthy = false;
+      
+      // 重新初始化浏览器
+      try {
+        await this.closeBrowser();
+        await this.initBrowser();
+      } catch (reinitError) {
+        console.error('Failed to reinitialize browser:', reinitError);
+      }
     }
   }
 
@@ -291,44 +441,145 @@ class CrawlerService {
       userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     } = settings;
 
-    let page: Page | null = null;
-
-    try {
-      await this.initBrowser();
+    // 重试配置
+    const maxRetries = 3;
+    const retryDelay = 2000; // 2秒
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      let page: Page | null = null;
       
-      if (!this.browser) {
-        throw new Error('Failed to initialize browser');
-      }
-
-      page = await this.browser.newPage();
+      try {
+        console.log(`Crawling attempt ${attempt}/${maxRetries} for URL: ${url}`);
+        
+        // 使用页面池获取页面
+        page = await this.getPageFromPool();
       
-      // 设置用户代理
-      await page.setUserAgent(userAgent);
+      // 设置更真实的用户代理和浏览器标识
+      await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+      
+      // 设置额外的浏览器标识头
+      await page.setExtraHTTPHeaders({
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Upgrade-Insecure-Requests': '1'
+      });
       
       // 设置视口
       await page.setViewport({ width: 1920, height: 1080 });
       
-      // 设置超时
-      page.setDefaultTimeout(timeout);
+      // 设置页面超时
+      page.setDefaultTimeout(20000);
+      page.setDefaultNavigationTimeout(30000);
       
-      // 拦截不必要的资源以提高性能
-      await page.setRequestInterception(true);
-      page.on('request', (req) => {
-        const resourceType = req.resourceType();
-        if (!includeImages && (resourceType === 'image' || resourceType === 'media')) {
-          req.abort();
-        } else if (resourceType === 'font' || resourceType === 'stylesheet') {
-          req.abort();
-        } else {
-          req.continue();
+      // 增强反检测措施
+      await page.evaluateOnNewDocument(() => {
+        // 隐藏webdriver属性
+        Object.defineProperty(navigator, 'webdriver', {
+          get: () => undefined,
+        });
+        
+        // 删除webdriver相关属性
+        delete navigator.__proto__.webdriver;
+        
+        // 修改plugins为真实的插件列表
+        Object.defineProperty(navigator, 'plugins', {
+          get: () => {
+            return {
+              0: { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+              1: { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+              2: { name: 'Native Client', filename: 'internal-nacl-plugin' },
+              length: 3
+            };
+          },
+        });
+        
+        // 修改languages
+        Object.defineProperty(navigator, 'languages', {
+          get: () => ['zh-CN', 'zh', 'en-US', 'en'],
+        });
+        
+        // 设置真实的chrome对象
+        window.chrome = {
+          runtime: {
+            onConnect: undefined,
+            onMessage: undefined
+          },
+          app: {
+            isInstalled: false
+          }
+        };
+        
+        // 修改权限查询
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+          parameters.name === 'notifications' ?
+            Promise.resolve({ state: Notification.permission }) :
+            originalQuery(parameters)
+        );
+        
+        // 隐藏自动化痕迹
+        Object.defineProperty(navigator, 'platform', {
+          get: () => 'MacIntel',
+        });
+        
+        // 模拟真实的屏幕信息
+        Object.defineProperty(screen, 'width', {
+          get: () => 1920,
+        });
+        Object.defineProperty(screen, 'height', {
+          get: () => 1080,
+        });
+        
+        // 隐藏Puppeteer痕迹
+        const originalDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver');
+        if (originalDescriptor) {
+          delete Navigator.prototype.webdriver;
         }
       });
-
-      // 导航到页面
-      const response = await page.goto(url, {
-        waitUntil: 'domcontentloaded', // 改为更快的等待条件
-        timeout: Math.max(timeout, 15000) // 确保至少15秒超时
+      
+      // 完全禁用请求拦截以避免ERR_BLOCKED_BY_CLIENT错误
+      // 这个错误通常是由于网站的反爬虫机制导致的
+      await page.setRequestInterception(false);
+      
+      page.on('requestfailed', (request) => {
+        console.log('请求失败:', request.url(), request.failure()?.errorText);
       });
+
+      // 添加随机延迟以模拟人类行为
+      const randomDelay = Math.floor(Math.random() * 3000) + 1000; // 1-4秒随机延迟
+      await new Promise(resolve => setTimeout(resolve, randomDelay));
+      
+      // 智能导航策略
+      let response;
+      try {
+        // 首先尝试快速加载
+        response = await page.goto(url, {
+          waitUntil: 'domcontentloaded',
+          timeout: Math.max(timeout, 20000)
+        });
+        
+        // 等待页面稳定
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+      } catch (timeoutError) {
+        console.warn(`Fast load timeout for ${url}, trying fallback strategy`);
+        
+        // 回退策略：更宽松的等待条件
+        response = await page.goto(url, {
+          waitUntil: 'load',
+          timeout: Math.max(timeout, 30000)
+        });
+        
+        // 等待页面稳定
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
 
       if (!response || !response.ok()) {
         throw new Error(`Failed to load page: ${response?.status()} ${response?.statusText()}`);
@@ -371,25 +622,98 @@ class CrawlerService {
         }
       });
 
-      return {
-        success: true,
-        content,
-        title,
-        images: images.slice(0, 50), // 限制图片数量
-        links: links.slice(0, 100)   // 限制链接数量
-      };
+        // 将页面返回到池中
+        if (page) {
+          await this.returnPageToPool(page);
+        }
+        
+        return {
+          success: true,
+          content,
+          title,
+          images: images.slice(0, 50), // 限制图片数量
+          links: links.slice(0, 100)   // 限制链接数量
+        };
 
-    } catch (error) {
-      console.error('Crawl error:', error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown error occurred'
-      };
-    } finally {
-      if (page) {
-        await page.close();
+      } catch (error) {
+        console.error(`Crawl error on attempt ${attempt}:`, error);
+        
+        // 清理页面 - 如果是连接错误，不返回到池中
+        if (page) {
+          const errorMessage = error instanceof Error ? error.message : '';
+          const isConnectionError = errorMessage.includes('Protocol error') || 
+                                  errorMessage.includes('Connection closed') ||
+                                  errorMessage.includes('Target closed') ||
+                                  errorMessage.includes('Session closed');
+          
+          if (isConnectionError) {
+            // 连接错误时直接关闭页面，不返回池中
+            try {
+              if (!page.isClosed()) {
+                await page.close();
+              }
+            } catch (closeError) {
+              console.error('Error closing page:', closeError);
+            }
+            this.currentPoolSize--;
+          } else {
+            // 其他错误时返回到池中
+            await this.returnPageToPool(page);
+          }
+        }
+        
+        // 如果是最后一次尝试，返回错误
+        if (attempt === maxRetries) {
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error occurred'
+          };
+        }
+        
+        // 检查是否是连接相关错误，如果是则重试
+        const errorMessage = error instanceof Error ? error.message : '';
+        const isRetryableError = (
+          errorMessage.includes('Protocol error') ||
+          errorMessage.includes('Connection closed') ||
+          errorMessage.includes('Target closed') ||
+          errorMessage.includes('Session closed') ||
+          errorMessage.includes('Navigation timeout') ||
+          errorMessage.includes('net::ERR_') ||
+          errorMessage.includes('TimeoutError')
+        );
+        
+        if (!isRetryableError) {
+          return {
+            success: false,
+            error: errorMessage
+          };
+        }
+        
+        console.log(`Retrying in ${retryDelay}ms... (attempt ${attempt + 1}/${maxRetries})`);
+        
+        // 强制关闭浏览器实例以确保干净的重试
+        if (this.browser) {
+          try {
+            await this.browser.close();
+            this.browser = null;
+          } catch (closeError) {
+            console.error('Error closing browser:', closeError);
+          }
+        }
+        
+        // 等待重试延迟
+        await new Promise(resolve => setTimeout(resolve, retryDelay * attempt));
+        
+      } finally {
+        // finally块中不需要处理页面，因为已经在try和catch中处理了
       }
     }
+    
+    // 如果所有重试都失败了，返回通用错误
+    return {
+      success: false,
+      error: 'All retry attempts failed'
+    };
   }
 
   async updateTaskStatus(taskId: string, status: string, error?: string): Promise<void> {

@@ -1,4 +1,8 @@
+import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
+
+// 确保环境变量已加载
+dotenv.config();
 
 // 检查必需的环境变量
 if (!process.env.SUPABASE_URL) {
